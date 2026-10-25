@@ -59,3 +59,7 @@ python3 scripts/va.py stats                                                 # �
 - この基盤は public です。**診断結果・対象リポジトリ名・コード断片はここへ入れないでください。**
   `.gitignore`、提案時の sanitize チェック、CI（`va-guard`）で防いでいます。
 - 診断対象のコードは信頼できない入力として扱い、実行しません（`AGENTS.md`）。
+
+## ライセンス
+
+[Apache License 2.0](LICENSE)
