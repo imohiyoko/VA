@@ -14,6 +14,10 @@ old="$(cat .agents/VERSION 2>/dev/null || echo none)"
 if [ "${1:-}" != "--no-branch" ]; then git switch -c "va-sync/$(date +%Y%m%d-%H%M%S)"; fi
 
 if ! git merge --no-edit "upstream/$BRANCH" -m "Sync VA upstream"; then
+  if ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+    echo "merge did not start (unrelated histories? run bootstrap-operator.sh or merge manually)" >&2
+    exit 3
+  fi
   # operator/ は常に自分側を正とする
   git checkout --ours -- operator 2>/dev/null || true
   git add operator 2>/dev/null || true
