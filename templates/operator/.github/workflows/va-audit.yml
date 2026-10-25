@@ -1,0 +1,130 @@
+# 定期脆弱性診断。target ごとに run を作り、結果を PR として運用リポジトリに出す。
+#
+# Secrets:
+#   CLAUDE_CODE_OAUTH_TOKEN か ANTHROPIC_API_KEY  … モデル呼び出し
+#   VA_TARGETS_TOKEN … 診断対象リポジトリの contents:read（fine-grained PAT 推奨）
+# Settings: Actions → General → "Allow GitHub Actions to create and approve pull requests" を有効化
+name: VA audit
+
+on:
+  schedule:
+    - cron: "17 18 * * 0"   # 毎週月曜 03:17 JST
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "owner/repo（空なら全 target）"
+        required: false
+      mode:
+        type: choice
+        options: [auto, full, diff]
+        default: auto
+
+permissions:
+  contents: read
+
+concurrency:
+  group: va-audit
+  cancel-in-progress: false
+
+jobs:
+  targets:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.t.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: t
+        env:
+          ONLY: ${{ inputs.target }}
+        run: |
+          m=$(python3 scripts/va.py targets | python3 -c 'import json,os,sys; t=json.load(sys.stdin); o=os.environ.get("ONLY") or ""; print(json.dumps([x for x in t if not o or x["repo"]==o]))')
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+
+  audit:
+    needs: targets
+    if: needs.targets.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      contents: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        target: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    env:
+      TARGET: ${{ matrix.target.repo }}
+      TARGET_ID: ${{ matrix.target.id }}
+      MODE: ${{ inputs.mode || 'auto' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout target (read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.target.repo }}
+          ref: ${{ matrix.target.ref }}
+          path: work/target
+          token: ${{ secrets.VA_TARGETS_TOKEN }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install scanners and Claude Code
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pip install --quiet semgrep || echo "semgrep install failed (will be reported as missing)"
+          mkdir -p "$HOME/.local/bin" && cd "$RUNNER_TEMP"
+          gh release download -R gitleaks/gitleaks -p '*linux_x64.tar.gz' -O gitleaks.tgz \
+            && tar xzf gitleaks.tgz gitleaks && mv gitleaks "$HOME/.local/bin/" || echo "gitleaks install failed"
+          gh release download -R google/osv-scanner -p 'osv-scanner_linux_amd64' -O "$HOME/.local/bin/osv-scanner" \
+            && chmod +x "$HOME/.local/bin/osv-scanner" || echo "osv-scanner install failed"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          npm install -g @anthropic-ai/claude-code
+
+      - name: Audit
+        id: audit
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          RUN=$(python3 scripts/va.py plan --target "$TARGET" --src work/target --mode "$MODE")
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+          python3 scripts/va.py exec --run "$RUN"
+          python3 scripts/va.py report --run "$RUN"
+
+      - name: Retrospective
+        continue-on-error: true
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          RUN: ${{ steps.audit.outputs.run }}
+        run: |
+          rm -rf work/target   # 対象コードを残さない（retrospective は対象コードを読む必要がない）
+          claude -p --model "$(python3 scripts/va.py config retro_model)" --max-turns 40 \
+            --allowedTools "Read,Grep,Glob,Write,Edit,Bash(python3 scripts/va.py stats:*)" \
+            "Read .agents/prompts/retrospective.md and follow it for the run at $RUN (target $TARGET). Write only under operator/."
+
+      - name: Open PR with results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ steps.audit.outputs.run }}
+        run: |
+          git config user.name "va-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          branch="va-run/${TARGET_ID}/$(basename "$RUN")"
+          git switch -c "$branch"
+          git add operator
+          git commit -qm "VA run: ${TARGET} $(basename "$RUN")"
+          git push -q origin "$branch"
+          head -c 60000 "$RUN/report.md" > "$RUNNER_TEMP/body.md"
+          gh pr create --title "VA: ${TARGET} $(basename "$RUN")" --body-file "$RUNNER_TEMP/body.md"

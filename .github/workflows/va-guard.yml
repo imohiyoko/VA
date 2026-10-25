@@ -1,0 +1,50 @@
+# VA（public）を守るためのチェック。運用リポジトリにマージされた場合は、サニタイズ部分を自動でスキップする。
+name: va-guard
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate checklists and prompts
+        run: python3 scripts/va.py validate
+
+      - name: Shell syntax
+        run: for f in scripts/*.sh; do bash -n "$f"; done
+
+      - name: Detect operator repository
+        id: kind
+        run: |
+          if git ls-files operator | grep -q .; then echo "operator=true" >> "$GITHUB_OUTPUT"; else echo "operator=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: No operator data, no secrets (public upstream only)
+        if: steps.kind.outputs.operator == 'false'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then BASE=EMPTY; fi
+          bash scripts/va-sanitize-check.sh . "$BASE"
+
+      - name: Version bump when methodology changes (PRs to upstream)
+        if: github.event_name == 'pull_request' && steps.kind.outputs.operator == 'false'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git diff --name-only "$BASE"...HEAD | grep -qE '^(\.agents/(checklists|prompts|methodology|model-profiles)/|scripts/va\.py)'; then
+            git diff --name-only "$BASE"...HEAD | grep -qx '.agents/VERSION' || { echo "::error::methodology changed: bump .agents/VERSION and update .agents/CHANGELOG.md"; exit 1; }
+            git diff --name-only "$BASE"...HEAD | grep -qx '.agents/CHANGELOG.md' || { echo "::error::update .agents/CHANGELOG.md"; exit 1; }
+          fi

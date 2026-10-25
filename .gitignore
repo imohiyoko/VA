@@ -1,0 +1,22 @@
+# VA は public。運用データは絶対にここへ入れない。
+# 下のブロックは運用リポジトリでは scripts/va-operator-gitignore.sh が自動で取り除く（運用データを追跡するため）。
+# >>> va:operator-data
+/operator/
+# <<< va:operator-data
+
+# 作業領域（診断対象の clone、ツールの生出力）。どちらのリポジトリでも追跡しない
+/work/
+
+# 秘密情報・ローカル設定
+.env
+.env.*
+*.local.*
+*.pem
+*.key
+.claude/settings.local.json
+CLAUDE.local.md
+
+# 生成物・OS
+__pycache__/
+*.pyc
+.DS_Store

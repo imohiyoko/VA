@@ -1,0 +1,39 @@
+# 上流 VA の更新を週1で取り込み、PR にする。
+name: VA sync upstream
+
+on:
+  schedule:
+    - cron: "41 17 * * 6"   # 毎週日曜 02:41 JST（診断の前日）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Merge upstream
+        id: sync
+        env:
+          VA_UPSTREAM_URL: ${{ vars.VA_UPSTREAM_URL }}
+        run: |
+          git config user.name "va-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "${VA_UPSTREAM_URL:-https://github.com/imohiyoko/VA.git}" 2>/dev/null || true
+          bash scripts/va-sync-upstream.sh | tee "$RUNNER_TEMP/out.txt"
+          echo "branch=$(git branch --show-current)" >> "$GITHUB_OUTPUT"
+      - name: Open PR
+        if: startsWith(steps.sync.outputs.branch, 'va-sync/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.sync.outputs.branch }}
+        run: |
+          git push -q origin "$BRANCH"
+          { echo "上流 VA の更新を取り込みます。"; echo; tail -n 1 "$RUNNER_TEMP/out.txt"; echo;
+            echo "変更内容は .agents/CHANGELOG.md を参照。MINOR 以上が上がった場合、次回の診断はフルスキャンになります。"; } > "$RUNNER_TEMP/body.md"
+          gh pr create --title "Sync VA upstream" --body-file "$RUNNER_TEMP/body.md"

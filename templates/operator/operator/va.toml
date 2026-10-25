@@ -1,0 +1,23 @@
+# VA 運用設定。scripts/va.py が読む。
+
+[defaults]
+model = "claude-haiku-5-5"        # summarize / review / triage に使うモデル
+escalate_model = ""               # 例: "claude-sonnet-5-5"。設定すると escalate_when の重大度の候補だけこのモデルでトリアージ
+escalate_when = ["critical", "high"]
+retro_model = "claude-haiku-5-5"  # retrospective（CI）に使うモデル
+runner = "claude"                 # claude（Claude Code CLI）| anthropic（API 直接, ANTHROPIC_API_KEY）| "cmd:<任意のコマンド>"
+jobs = 4                          # 並列数
+full_every = 4                    # N 回に1回フルスキャン
+review_budget = 300               # 1 run でレビューするファイル数の上限
+rotate_per_run = 20               # diff モードで毎回追加レビューする高リスク未変更ファイル数
+chunk_lines = 400
+max_file_bytes = 200000
+semgrep_config = "p/default"
+exclude = []                      # 全 target 共通の除外 glob
+
+# 診断対象。enabled = false で一時停止。
+# [[targets]]
+# repo = "imohiyoko/example"
+# ref = ""                        # 空ならデフォルトブランチ
+# exclude = ["docs/**", "examples/**"]
+# model = "claude-sonnet-5-5"     # target ごとの上書きも可

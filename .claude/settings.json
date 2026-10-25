@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 scripts/va.py:*)",
+      "Bash(bash scripts/va-sanitize-check.sh:*)"
+    ],
+    "deny": [
+      "Edit(work/target/**)",
+      "Write(work/target/**)",
+      "Read(./.env)",
+      "Read(./.env.*)"
+    ]
+  }
+}

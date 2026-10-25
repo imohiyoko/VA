@@ -1,0 +1,15 @@
+# Changelog
+
+`.agents/VERSION` の変更履歴。SemVer の意味は次のとおり。
+
+- **MAJOR**: finding の形式・fingerprint の算出方法・ディレクトリ構成が変わり、過去の run と直接比較できなくなる変更
+- **MINOR**: チェック項目・手法・プロンプトの追加や挙動の変化（検出結果が変わりうる）
+- **PATCH**: 誤字・説明の明確化など、検出結果に影響しない変更
+
+上流 PR では必ずこのファイルに1行追記し、`VERSION` を上げる。
+
+## 0.1.0 — 2026-10-25
+
+- 初版。決定的パイプライン `scripts/va.py`（plan / summarize / review / triage / report）と軽量モデル向けタスクプロンプト、
+  タグで選ぶチェックリスト 17 種、blob SHA による要約キャッシュ、retrospective / upstream-proposer、
+  モデルプロファイルの雛形、運用リポジトリ用テンプレート、`va-guard` CI。
