@@ -41,6 +41,9 @@ jobs:
           git -C work/upstream config user.name "va-bot"
           git -C work/upstream config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           mkdir -p work/proposals
+      - name: Keep sanitize denylist outside the agent workspace
+        if: steps.ready.outputs.count != '0'
+        run: cp operator/sanitize-denylist.txt "$RUNNER_TEMP/sanitize-denylist.txt"
       - name: Prepare proposals (no push rights in this step)
         if: steps.ready.outputs.count != '0'
         env:
@@ -56,9 +59,20 @@ jobs:
         if: steps.ready.outputs.count != '0'
         env:
           GH_TOKEN: ${{ secrets.VA_UPSTREAM_TOKEN }}
+          UPSTREAM_REPO: ${{ vars.VA_UPSTREAM_REPO || 'imohiyoko/VA' }}
+          # 前のステップのエージェントが ~/.gitconfig を書き換えていても使わない
+          GIT_CONFIG_GLOBAL: ${{ runner.temp }}/va-push.gitconfig
         run: |
+          # エージェントが書き換えたかもしれないスクリプトを戻す
+          git checkout HEAD -- scripts
+          # トークンを持った git は、エージェントが触った work/upstream（設定・フック）では動かさない。
+          # 新しく clone し、提案ブランチのコミットだけを取り込む。
+          : > "$GIT_CONFIG_GLOBAL"
+          rm -rf work/upstream-push
+          gh repo clone "$UPSTREAM_REPO" work/upstream-push -- -q
+          git -C work/upstream-push fetch -q ../upstream 'refs/heads/proposal/*:refs/heads/proposal/*'
           gh auth setup-git
-          bash scripts/va-propose-push.sh work/upstream work/proposals operator/sanitize-denylist.txt
+          bash scripts/va-propose-push.sh work/upstream-push work/proposals "$RUNNER_TEMP/sanitize-denylist.txt"
       - name: Record candidate status
         if: steps.ready.outputs.count != '0'
         run: |
