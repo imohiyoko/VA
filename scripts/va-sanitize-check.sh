@@ -33,6 +33,11 @@ else
 fi
 files="$(git diff --name-only "${range[@]}"; git diff --name-only; git ls-files --others --exclude-standard)" || exit 2
 diff_text="$(git diff "${range[@]}"; git diff)" || exit 2
+# 途中のコミットで足して後で消した内容も公開履歴に残るので、コミットごとの差分も検査する
+if [ "$base" = "EMPTY" ]; then hist="$(git log -p --format= HEAD)" || exit 2
+else hist="$(git log -p --format= "$base..HEAD")" || exit 2; fi
+diff_text="$diff_text
+$hist"
 # 追加行（ファイルヘッダの '+++ ' は除き、'+' で始まる内容の行は含める）
 added="$(printf '%s\n' "$diff_text" | awk '/^diff --git /{h=1} /^@@/{h=0; next} !h && /^\+/' || true)"
 # コミットメッセージと追加テキストも public に出る
