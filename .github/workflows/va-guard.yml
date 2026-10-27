@@ -26,10 +26,17 @@ jobs:
       - name: Shell syntax
         run: for f in scripts/*.sh; do bash -n "$f"; done
 
+      # PR の head ではなく、マージ先（base）の内容で判定する。PR で operator/ を足してもチェックは飛ばせない。
       - name: Detect operator repository
         id: kind
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
-          if git ls-files operator | grep -q .; then echo "operator=true" >> "$GITHUB_OUTPUT"; else echo "operator=false" >> "$GITHUB_OUTPUT"; fi
+          if [ -n "$BASE" ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then ref="$BASE"
+          elif [ "$EVENT" = "pull_request" ]; then echo "operator=false" >> "$GITHUB_OUTPUT"; exit 0
+          else ref=HEAD; fi
+          if git ls-tree -r --name-only "$ref" -- operator | grep -q .; then echo "operator=true" >> "$GITHUB_OUTPUT"; else echo "operator=false" >> "$GITHUB_OUTPUT"; fi
 
       - name: No operator data, no secrets (public upstream only)
         if: steps.kind.outputs.operator == 'false'
