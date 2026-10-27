@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
 # 上流（public）へ出す差分に、運用データ・対象を特定できる語・シークレットが含まれていないか確認する。
 #
-#   scripts/va-sanitize-check.sh <repo-dir> <base-ref|EMPTY> [denylist-file]
+#   scripts/va-sanitize-check.sh <repo-dir> <base-ref|EMPTY> [denylist-file] [extra-text-file]
 #
 # denylist-file: 1行1語（大文字小文字無視の固定文字列）。'#' で始まる行と空行は無視。
 #                運用リポジトリの operator/sanitize-denylist.txt を渡す（このファイル自体は public に出さない）。
+#                指定したのに読めない場合は失敗する（exit 2）。省略するときは空文字列ではなく引数ごと省く。
+# extra-text-file: 差分と同じ検査（denylist・シークレット・fingerprint）にかける追加のテキスト（PR のタイトル・本文など）。
+# 範囲内のコミットメッセージも同じ検査にかける（public に出るため）。
 set -euo pipefail
-repo="$1"; base="$2"; deny="${3:-}"
+repo="$1"; base="$2"; deny_given=$(( $# >= 3 )); deny="${3:-}"; extra="${4:-}"
+if [ "$deny_given" -eq 1 ] && { [ -z "$deny" ] || [ ! -f "$deny" ] || [ ! -r "$deny" ]; }; then
+  echo "SANITIZE: denylist '$deny' is not a readable file" >&2; exit 2
+fi
+if [ -n "$extra" ] && { [ ! -f "$extra" ] || [ ! -r "$extra" ]; }; then
+  echo "SANITIZE: extra text '$extra' is not a readable file" >&2; exit 2
+fi
+# cd の前に絶対パスにする
+[ -n "$deny" ] && deny="$(cd "$(dirname "$deny")" && pwd)/$(basename "$deny")"
+[ -n "$extra" ] && extra="$(cd "$(dirname "$extra")" && pwd)/$(basename "$extra")"
 fail=0
 err() { echo "SANITIZE: $*" >&2; fail=1; }
 
@@ -21,7 +33,15 @@ else
 fi
 files="$(git diff --name-only "${range[@]}"; git diff --name-only; git ls-files --others --exclude-standard)" || exit 2
 diff_text="$(git diff "${range[@]}"; git diff)" || exit 2
-added="$(printf '%s\n' "$diff_text" | grep -E '^\+[^+]' || true)"
+# 追加行（ファイルヘッダの '+++ ' は除き、'+' で始まる内容の行は含める）
+added="$(printf '%s\n' "$diff_text" | awk '/^diff --git /{h=1} /^@@/{h=0; next} !h && /^\+/' || true)"
+# コミットメッセージと追加テキストも public に出る
+if [ "$base" = "EMPTY" ]; then msgs="$(git log --format=%B HEAD)" || exit 2
+else msgs="$(git log --format=%B "$base..HEAD")" || exit 2; fi
+added="$added
+$msgs"
+if [ -n "$extra" ]; then added="$added
+$(cat "$extra")"; fi
 
 # 1. 運用データのパス
 if printf '%s\n' "$files" | grep -E '^(operator/|work/)' >/dev/null; then
@@ -29,7 +49,7 @@ if printf '%s\n' "$files" | grep -E '^(operator/|work/)' >/dev/null; then
 fi
 
 # 2. 運用側の非公開語リスト
-if [ -n "$deny" ] && [ -f "$deny" ]; then
+if [ -n "$deny" ]; then
   while IFS= read -r term || [ -n "$term" ]; do
     term="${term%%$'\r'}"
     [[ -z "$term" || "$term" == \#* ]] && continue
