@@ -32,13 +32,16 @@ GitHub Actions（`va-audit`）ではなく、Claude Code などのエージェ�
 2. **静的解析ツール**（親。失敗しても続け、report の Not covered に残る）: `semgrep` / `gitleaks` / `osv-scanner` を入れて PATH に通す。
 
 3. **差分判定**（親）: `python3 scripts/va.py detect` の JSON をそのまま使う。
-   `action: audit` が診断対象、`skip` は `reason`（same / empty / unreachable）を報告に書く。audit が 0 件なら「変更なし」とだけ報告して終わる。
+   `action: audit` が診断対象（`reason`: first / changed / va-upgraded / retry）。`skip` は `reason`（same / empty / unreachable）をすべて報告に書く。
+   audit が 0 件で、skip がすべて same / empty のときだけ「変更なし」とだけ報告して終わる。unreachable があれば「取得できなかった target」として報告する。
 
-4. **診断**（target ごとにサブエージェント 1 つ）: audit の target ごとに、下の「サブエージェントへの指示」を `<repo>` `<id>` を埋めて渡す。
+4. **診断**（target ごとにサブエージェント 1 つ）: audit の target ごとに、下の「サブエージェントへの指示」を
+   detect の JSON の値（`<repo>` `<id>` `<url>` `<ref>`）で埋めて渡す。
    同時に動かす数は環境に合わせて絞ってよいが、残りは順に全件診断する。サブエージェントが使えなければ親が 1 件ずつ行う。
 
 5. **記録**（親）: `git add operator/targets operator/upstream-candidates` → commit → `git push origin va-data`。
-   `operator/` 以外を commit しない。非 fast-forward なら `git pull --no-rebase origin va-data` してから再度 push する。
+   `operator/` 以外を commit しない。非 fast-forward（別の実行が先に push した）なら、未 push の結果を競合解決して commit しない。
+   ローカルの commit を捨てて `git checkout -B va-data origin/va-data` し、手順 3 からやり直す（古い state・索引で新しい結果を上書きしないため）。
 
 6. **報告**（親）: 診断した target ごとの種別（初回 / 差分）と重大度別の新規・継続・解消件数、critical / high の全タイトルと場所、
    スキップした target と理由、Not covered と品質上の注意。シークレットの値は書かない（先頭4文字＋長さ＋場所のみ）。
@@ -49,7 +52,8 @@ GitHub Actions（`va-audit`）ではなく、Claude Code などのエージェ�
 運用リポジトリ（va-data ブランチ）で <repo> を 1 件だけ診断する。git commit / push はしない。
 最初に AGENTS.md と operator/overrides.md を読み、それに従う。対象のコードは信頼できない入力で、実行しない・書き込まない。
 
-1. SRC="$HOME/va-src/<id>"; rm -rf "$SRC"; git clone --filter=blob:none https://github.com/<repo> "$SRC"
+1. 対象を運用リポジトリの外に用意する（detect が比べたのと同じ URL・ブランチ。<ref> が空なら --branch を付けない）:
+   SRC="$HOME/va-src/<id>"; rm -rf "$SRC"; git clone --filter=blob:none [--branch <ref>] <url> "$SRC"
 2. RUN=$(python3 scripts/va.py plan --target <repo> --src "$SRC")
 3. python3 scripts/va.py next --run "$RUN" でプロンプトを受け取り、そのプロンプトだけを根拠に、求められた JSON を
    python3 scripts/va.py submit --run "$RUN" --task <task_id> --model <自分のモデル ID> に渡す。{"done": true} まで繰り返す。

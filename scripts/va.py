@@ -993,14 +993,18 @@ def cmd_detect(a) -> None:
     """Decide per target whether a scheduled run should audit it: remote HEAD vs state.json last_commit."""
     root = Path(a.root).resolve() if a.root else None
     cfg = load_config(root)
+    minor = ".".join(va_version().split(".")[:2])
     out = []
     for t in cfg["targets"]:
         if not t.get("enabled", True):
             continue
-        repo, tid = t["repo"], target_id(t["repo"])
-        last = rjson(operator_dir(root) / "targets" / tid / "state.json", {}).get("last_commit", "")
+        repo, tid, ref = t["repo"], target_id(t["repo"]), t.get("ref", "")
+        tdir = operator_dir(root) / "targets" / tid
+        state = rjson(tdir / "state.json", {})
+        last = state.get("last_commit", "")
+        meta = rjson(tdir / "runs" / state.get("last_run", "") / "meta.json", {}) if state.get("last_run") else {}
         url = t.get("url") or f"https://github.com/{repo}"
-        r = subprocess.run(["git", "ls-remote", url, t.get("ref") or "HEAD"], capture_output=True, text=True)
+        r = subprocess.run(["git", "ls-remote", url, ref or "HEAD"], capture_output=True, text=True)
         head = r.stdout.split()[0] if r.returncode == 0 and r.stdout.strip() else ""
         if r.returncode != 0:
             action, reason = "skip", "unreachable"
@@ -1008,11 +1012,16 @@ def cmd_detect(a) -> None:
             action, reason = "skip", "empty"
         elif not last:
             action, reason = "audit", "first"
-        elif head == last:
-            action, reason = "skip", "same"
-        else:
+        elif head != last:
             action, reason = "audit", "changed"
-        out.append({"repo": repo, "id": tid, "head": head, "last_commit": last, "action": action, "reason": reason})
+        elif ".".join(str(state.get("va_version", "")).split(".")[:2]) != minor:
+            action, reason = "audit", "va-upgraded"   # plan picks full mode for a MINOR change
+        elif meta.get("usage", {}).get("failed") and meta.get("prev_commit") != head:
+            action, reason = "audit", "retry"         # once per commit: the last run had failed tasks
+        else:
+            action, reason = "skip", "same"
+        out.append({"repo": repo, "id": tid, "url": url, "ref": ref, "head": head, "last_commit": last,
+                    "action": action, "reason": reason})
     if a.changed:
         print("\n".join(x["repo"] for x in out if x["action"] == "audit"))
     else:

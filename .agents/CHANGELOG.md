@@ -8,11 +8,13 @@
 
 上流 PR では必ずこのファイルに1行追記し、`VERSION` を上げる。
 
-## 0.1.2 — 2026-10-30
+## 0.2.0 — 2026-10-30
 
 - `osv-scanner` を `--no-ignore` で実行する。対象の clone が運用リポジトリの `work/`（.gitignore 対象）にあると
-  lockfile がすべて無視され、毎回 `failed` になっていた（検出の不具合修正なので PATCH。フルスキャンは強制しない）。
-- `va.py detect` を追加: target ごとにリモートの HEAD と前回診断したコミットを比べ、audit / skip（first・changed・same・empty・unreachable）を出す。
+  lockfile がすべて無視され、毎回 `failed` になっていた。依存の検出結果が変わるので MINOR（次の run はフルスキャン）。
+- `va.py detect` を追加: target ごとにリモートの HEAD（`ref` があればそのブランチ）と前回診断したコミットを比べ、
+  audit（first・changed・va-upgraded・retry）/ skip（same・empty・unreachable）を出す。
+  HEAD が同じでも、VA の MINOR 以上が上がった target と、前回の run に失敗タスクがあった target（同じコミットで 1 回だけ）は audit にする。
 - 運用テンプレートに `operator/routine.md`（エージェントのスケジュール実行用。結果は `va-data` ブランチに直接記録）を追加。
 
 ## 0.1.1 — 2026-10-27
