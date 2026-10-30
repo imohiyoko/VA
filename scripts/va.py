@@ -336,7 +336,9 @@ def run_tools(src: Path, raw: Path, cfg: dict) -> tuple[dict, list[dict]]:
     # osv-scanner: deterministic, not LLM-triaged (reachability is reported as unknown)
     if avail("osv-scanner"):
         out = raw / "osv.json"
-        for args in (["scan", "source", "-r"], ["-r"]):
+        # --no-ignore: the clone usually sits in a directory the operator repository ignores (work/),
+        # and without it osv-scanner skips every lockfile and finds no package sources.
+        for args in (["scan", "source", "-r", "--no-ignore"], ["-r", "--no-ignore"]):
             r = subprocess.run(["osv-scanner", *args, "--format", "json", str(src)], capture_output=True, text=True)
             if r.stdout.strip().startswith("{"):
                 out.write_text(r.stdout)
@@ -987,6 +989,36 @@ def cmd_targets(a) -> None:
                       for t in cfg["targets"] if t.get("enabled", True)]))
 
 
+def cmd_detect(a) -> None:
+    """Decide per target whether a scheduled run should audit it: remote HEAD vs state.json last_commit."""
+    root = Path(a.root).resolve() if a.root else None
+    cfg = load_config(root)
+    out = []
+    for t in cfg["targets"]:
+        if not t.get("enabled", True):
+            continue
+        repo, tid = t["repo"], target_id(t["repo"])
+        last = rjson(operator_dir(root) / "targets" / tid / "state.json", {}).get("last_commit", "")
+        url = t.get("url") or f"https://github.com/{repo}"
+        r = subprocess.run(["git", "ls-remote", url, t.get("ref") or "HEAD"], capture_output=True, text=True)
+        head = r.stdout.split()[0] if r.returncode == 0 and r.stdout.strip() else ""
+        if r.returncode != 0:
+            action, reason = "skip", "unreachable"
+        elif not head:
+            action, reason = "skip", "empty"
+        elif not last:
+            action, reason = "audit", "first"
+        elif head == last:
+            action, reason = "skip", "same"
+        else:
+            action, reason = "audit", "changed"
+        out.append({"repo": repo, "id": tid, "head": head, "last_commit": last, "action": action, "reason": reason})
+    if a.changed:
+        print("\n".join(x["repo"] for x in out if x["action"] == "audit"))
+    else:
+        print(json.dumps(out, indent=1))
+
+
 def cmd_config(a) -> None:
     cfg = load_config(Path(a.root).resolve() if a.root else None, a.target)
     v = cfg.get(a.key, "")
@@ -1034,6 +1066,10 @@ def main() -> None:
 
     sub.add_parser("validate", help="check checklists and prompt templates").set_defaults(fn=cmd_validate)
     sub.add_parser("targets", help="list enabled targets as JSON (CI matrix)").set_defaults(fn=cmd_targets)
+
+    p = sub.add_parser("detect", help="per target, audit or skip: remote HEAD vs last audited commit")
+    p.add_argument("--changed", action="store_true", help="print only the repos to audit, one per line")
+    p.set_defaults(fn=cmd_detect)
 
     p = sub.add_parser("config", help="print one config value (for CI)")
     p.add_argument("key")

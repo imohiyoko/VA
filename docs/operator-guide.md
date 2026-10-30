@@ -34,6 +34,15 @@
 | `va-sync-upstream` | 毎週日曜 / 手動 | VA の更新を取り込む PR を作る |
 | `va-propose-upstream` | `operator/upstream-candidates/` が main に入ったとき / 手動 | `status: ready` の候補を VA への PR にする |
 
+### エージェントのスケジュール実行で回す
+
+Actions の API キーを使わず、Claude Code などのスケジュール実行で回すこともできる。手順は `operator/routine.md`（雛形あり）。
+
+- 差分判定は `python3 scripts/va.py detect`（リモートの HEAD と `state.json` の `last_commit` を比較。`--changed` で診断対象だけを出す）
+- 結果は PR にせず **`va-data` ブランチに直接 commit** する。診断 PR がマージされずに残ると main の `state.json` が古くなり、
+  次回の差分判定が古い状態と比べてしまうため。最新の結果は `va-data` を見る
+- 誤検知などの判定（`suppressed`）は `va-data` 上の `state.json` に書く
+
 ## 4. 日々の運用
 
 1. **診断 PR が来たら** `report.md`（PR 本文）を読む
@@ -47,6 +56,7 @@
 
 ```bash
 git clone --filter=blob:none https://github.com/<owner>/<repo> work/target
+python3 scripts/va.py detect                        # 前回の診断から変更があるか
 RUN=$(python3 scripts/va.py plan --target <owner>/<repo> --src work/target)
 python3 scripts/va.py exec --run "$RUN"            # runner は operator/va.toml
 python3 scripts/va.py report --run "$RUN"
