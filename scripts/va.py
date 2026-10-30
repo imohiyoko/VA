@@ -298,6 +298,7 @@ def run_tools(src: Path, raw: Path, cfg: dict) -> tuple[dict, list[dict]]:
     # semgrep
     if avail("semgrep"):
         out = raw / "semgrep.json"
+        out.unlink(missing_ok=True)   # a stale file from an earlier run must not read as this run's result
         r = subprocess.run(["semgrep", "scan", "--config", cfg["semgrep_config"], "--json", "--quiet",
                             "--metrics=off", "--output", str(out), str(src)], capture_output=True, text=True)
         data = rjson(out, None)
@@ -320,6 +321,7 @@ def run_tools(src: Path, raw: Path, cfg: dict) -> tuple[dict, list[dict]]:
     # gitleaks (values are redacted by the tool)
     if avail("gitleaks"):
         out = raw / "gitleaks.json"
+        out.unlink(missing_ok=True)   # a stale file from an earlier run must not read as this run's result
         subprocess.run(["gitleaks", "detect", "--source", str(src), "--no-git", "--redact", "--exit-code", "0",
                         "--report-format", "json", "--report-path", str(out)], capture_output=True, text=True)
         data = rjson(out, None)
@@ -336,7 +338,10 @@ def run_tools(src: Path, raw: Path, cfg: dict) -> tuple[dict, list[dict]]:
     # osv-scanner: deterministic, not LLM-triaged (reachability is reported as unknown)
     if avail("osv-scanner"):
         out = raw / "osv.json"
-        for args in (["scan", "source", "-r"], ["-r"]):
+        out.unlink(missing_ok=True)   # a stale file from an earlier run must not read as this run's result
+        # --no-ignore: the clone usually sits in a directory the operator repository ignores (work/),
+        # and without it osv-scanner skips every lockfile and finds no package sources.
+        for args in (["scan", "source", "-r", "--no-ignore"], ["-r", "--no-ignore"]):
             r = subprocess.run(["osv-scanner", *args, "--format", "json", str(src)], capture_output=True, text=True)
             if r.stdout.strip().startswith("{"):
                 out.write_text(r.stdout)
@@ -987,6 +992,51 @@ def cmd_targets(a) -> None:
                       for t in cfg["targets"] if t.get("enabled", True)]))
 
 
+def cmd_detect(a) -> None:
+    """Decide per target whether a scheduled run should audit it: remote HEAD vs state.json last_commit."""
+    root = Path(a.root).resolve() if a.root else None
+    cfg = load_config(root)
+    minor = ".".join(va_version().split(".")[:2])
+    out = []
+    for t in cfg["targets"]:
+        if not t.get("enabled", True):
+            continue
+        repo, tid, ref = t["repo"], target_id(t["repo"]), t.get("ref", "")
+        tdir = operator_dir(root) / "targets" / tid
+        state = rjson(tdir / "state.json", {})
+        last = state.get("last_commit", "")
+        meta = rjson(tdir / "runs" / state.get("last_run", "") / "meta.json", {}) if state.get("last_run") else {}
+        url = t.get("url") or f"https://github.com/{repo}"
+        try:
+            r = subprocess.run(["git", "ls-remote", url, ref or "HEAD"], capture_output=True, text=True, timeout=120,
+                               env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+            rc, stdout = r.returncode, r.stdout
+        except subprocess.TimeoutExpired:
+            rc, stdout = 1, ""
+        head = stdout.split()[0] if rc == 0 and stdout.strip() else ""
+        failed = meta.get("usage", {}).get("failed") or any(v != "ok" for v in meta.get("tools", {}).values())
+        if rc != 0:
+            action, reason = "skip", "unreachable"
+        elif not head:
+            action, reason = "skip", "empty"
+        elif not last:
+            action, reason = "audit", "first"
+        elif head != last:
+            action, reason = "audit", "changed"
+        elif ".".join(str(state.get("va_version", "")).split(".")[:2]) != minor:
+            action, reason = "audit", "va-upgraded"   # plan picks full mode for a MINOR change
+        elif failed and meta.get("prev_commit") != head:
+            action, reason = "audit", "retry"         # once per commit: the last run had failed tasks or tools
+        else:
+            action, reason = "skip", "same"
+        out.append({"repo": repo, "id": tid, "url": url, "ref": ref, "head": head, "last_commit": last,
+                    "action": action, "reason": reason})
+    if a.changed:
+        print("\n".join(x["repo"] for x in out if x["action"] == "audit"))
+    else:
+        print(json.dumps(out, indent=1))
+
+
 def cmd_config(a) -> None:
     cfg = load_config(Path(a.root).resolve() if a.root else None, a.target)
     v = cfg.get(a.key, "")
@@ -1034,6 +1084,10 @@ def main() -> None:
 
     sub.add_parser("validate", help="check checklists and prompt templates").set_defaults(fn=cmd_validate)
     sub.add_parser("targets", help="list enabled targets as JSON (CI matrix)").set_defaults(fn=cmd_targets)
+
+    p = sub.add_parser("detect", help="per target, audit or skip: remote HEAD vs last audited commit")
+    p.add_argument("--changed", action="store_true", help="print only the repos to audit, one per line")
+    p.set_defaults(fn=cmd_detect)
 
     p = sub.add_parser("config", help="print one config value (for CI)")
     p.add_argument("key")

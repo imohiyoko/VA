@@ -8,6 +8,16 @@
 
 上流 PR では必ずこのファイルに1行追記し、`VERSION` を上げる。
 
+## 0.2.0 — 2026-10-30
+
+- `osv-scanner` を `--no-ignore` で実行する。対象の clone が運用リポジトリの `work/`（.gitignore 対象）にあると
+  lockfile がすべて無視され、毎回 `failed` になっていた。依存の検出結果が変わるので MINOR（次の run はフルスキャン）。
+- `va.py detect` を追加: target ごとにリモートの HEAD（`ref` があればそのブランチ）と前回診断したコミットを比べ、
+  audit（first・changed・va-upgraded・retry）/ skip（same・empty・unreachable）を出す。
+  HEAD が同じでも、VA の MINOR 以上が上がった target と、前回の run に失敗したタスクか静的解析ツールがあった target（同じコミットで 1 回だけ）は audit にする。
+- 静的解析ツールの出力ファイルを実行前に消す（ツールが出力しなかったとき、前回の結果を今回の結果として読まないように）。
+- 運用テンプレートに `operator/routine.md`（エージェントのスケジュール実行用。結果は `va-data` ブランチに直接記録）を追加。
+
 ## 0.1.1 — 2026-10-27
 
 - サニタイズの強化: denylist が読めなければ失敗、`+` で始まる追加行・コミットメッセージ・PR 本文も検査。
