@@ -14,7 +14,8 @@
   lockfile がすべて無視され、毎回 `failed` になっていた。依存の検出結果が変わるので MINOR（次の run はフルスキャン）。
 - `va.py detect` を追加: target ごとにリモートの HEAD（`ref` があればそのブランチ）と前回診断したコミットを比べ、
   audit（first・changed・va-upgraded・retry）/ skip（same・empty・unreachable）を出す。
-  HEAD が同じでも、VA の MINOR 以上が上がった target と、前回の run に失敗タスクがあった target（同じコミットで 1 回だけ）は audit にする。
+  HEAD が同じでも、VA の MINOR 以上が上がった target と、前回の run に失敗したタスクか静的解析ツールがあった target（同じコミットで 1 回だけ）は audit にする。
+- 静的解析ツールの出力ファイルを実行前に消す（ツールが出力しなかったとき、前回の結果を今回の結果として読まないように）。
 - 運用テンプレートに `operator/routine.md`（エージェントのスケジュール実行用。結果は `va-data` ブランチに直接記録）を追加。
 
 ## 0.1.1 — 2026-10-27

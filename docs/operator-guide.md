@@ -39,7 +39,7 @@
 Actions の API キーを使わず、Claude Code などのスケジュール実行で回すこともできる。手順は `operator/routine.md`（雛形あり）。
 
 - 差分判定は `python3 scripts/va.py detect`（リモートの HEAD と `state.json` の `last_commit` を比較。`--changed` で診断対象だけを出す）。
-  HEAD が同じでも、VA の MINOR 以上が上がったとき（`va-upgraded`）と、前回の run に失敗タスクがあったとき（`retry`、同じコミットで 1 回だけ）は診断対象になる
+  HEAD が同じでも、VA の MINOR 以上が上がったとき（`va-upgraded`）と、前回の run に失敗したタスクか静的解析ツールがあったとき（`retry`、同じコミットで 1 回だけ）は診断対象になる
 - 結果は PR にせず **`va-data` ブランチに直接 commit** する。診断 PR がマージされずに残ると main の `state.json` が古くなり、
   次回の差分判定が古い状態と比べてしまうため。最新の結果は `va-data` を見る
 - 誤検知などの判定（`suppressed`）は `va-data` 上の `state.json` に書く

@@ -298,6 +298,7 @@ def run_tools(src: Path, raw: Path, cfg: dict) -> tuple[dict, list[dict]]:
     # semgrep
     if avail("semgrep"):
         out = raw / "semgrep.json"
+        out.unlink(missing_ok=True)   # a stale file from an earlier run must not read as this run's result
         r = subprocess.run(["semgrep", "scan", "--config", cfg["semgrep_config"], "--json", "--quiet",
                             "--metrics=off", "--output", str(out), str(src)], capture_output=True, text=True)
         data = rjson(out, None)
@@ -320,6 +321,7 @@ def run_tools(src: Path, raw: Path, cfg: dict) -> tuple[dict, list[dict]]:
     # gitleaks (values are redacted by the tool)
     if avail("gitleaks"):
         out = raw / "gitleaks.json"
+        out.unlink(missing_ok=True)   # a stale file from an earlier run must not read as this run's result
         subprocess.run(["gitleaks", "detect", "--source", str(src), "--no-git", "--redact", "--exit-code", "0",
                         "--report-format", "json", "--report-path", str(out)], capture_output=True, text=True)
         data = rjson(out, None)
@@ -336,6 +338,7 @@ def run_tools(src: Path, raw: Path, cfg: dict) -> tuple[dict, list[dict]]:
     # osv-scanner: deterministic, not LLM-triaged (reachability is reported as unknown)
     if avail("osv-scanner"):
         out = raw / "osv.json"
+        out.unlink(missing_ok=True)   # a stale file from an earlier run must not read as this run's result
         # --no-ignore: the clone usually sits in a directory the operator repository ignores (work/),
         # and without it osv-scanner skips every lockfile and finds no package sources.
         for args in (["scan", "source", "-r", "--no-ignore"], ["-r", "--no-ignore"]):
@@ -1004,9 +1007,15 @@ def cmd_detect(a) -> None:
         last = state.get("last_commit", "")
         meta = rjson(tdir / "runs" / state.get("last_run", "") / "meta.json", {}) if state.get("last_run") else {}
         url = t.get("url") or f"https://github.com/{repo}"
-        r = subprocess.run(["git", "ls-remote", url, ref or "HEAD"], capture_output=True, text=True)
-        head = r.stdout.split()[0] if r.returncode == 0 and r.stdout.strip() else ""
-        if r.returncode != 0:
+        try:
+            r = subprocess.run(["git", "ls-remote", url, ref or "HEAD"], capture_output=True, text=True, timeout=120,
+                               env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+            rc, stdout = r.returncode, r.stdout
+        except subprocess.TimeoutExpired:
+            rc, stdout = 1, ""
+        head = stdout.split()[0] if rc == 0 and stdout.strip() else ""
+        failed = meta.get("usage", {}).get("failed") or any(v != "ok" for v in meta.get("tools", {}).values())
+        if rc != 0:
             action, reason = "skip", "unreachable"
         elif not head:
             action, reason = "skip", "empty"
@@ -1016,8 +1025,8 @@ def cmd_detect(a) -> None:
             action, reason = "audit", "changed"
         elif ".".join(str(state.get("va_version", "")).split(".")[:2]) != minor:
             action, reason = "audit", "va-upgraded"   # plan picks full mode for a MINOR change
-        elif meta.get("usage", {}).get("failed") and meta.get("prev_commit") != head:
-            action, reason = "audit", "retry"         # once per commit: the last run had failed tasks
+        elif failed and meta.get("prev_commit") != head:
+            action, reason = "audit", "retry"         # once per commit: the last run had failed tasks or tools
         else:
             action, reason = "skip", "same"
         out.append({"repo": repo, "id": tid, "url": url, "ref": ref, "head": head, "last_commit": last,
