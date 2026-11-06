@@ -199,6 +199,8 @@ def lang_of(path: str) -> str | None:
         return LANG_BY_NAME.get(name, "dockerfile")
     if name.startswith(".env"):
         return "dotenv"
+    if re.fullmatch(r"requirements[^/]*\.txt", name):
+        return "pip-requirements"
     if re.search(r"(^|/)(\.husky|\.githooks)/[^/.]+$", path):
         return "shell"   # extensionless git hooks run on every commit
     return LANG_BY_EXT.get(os.path.splitext(name)[1].lower())
@@ -462,8 +464,8 @@ def cmd_plan(a) -> None:
     changed = sorted(p for p, f in files.items() if index.get(p, {}).get("blob") != f["blob"])
     deleted = sorted(set(index) - set(files))
 
-    # Unchanged files indexed before the malice_suspect field existed are summarized once more (one time only).
-    stale = sorted(p for p in files if p not in changed and "malice_suspect" not in index.get(p, {}))
+    # Unchanged files indexed before the malice_suspect field existed (or whose summary failed) are summarized again.
+    stale = sorted(p for p in files if p not in changed and index.get(p, {}).get("malice_suspect") is None)
     tasks = [{"id": f"s-{hashlib.sha1(p.encode()).hexdigest()[:10]}", "path": p} for p in changed + stale]
 
     tool_status, tool_cands = ({}, []) if a.no_tools else run_tools(src, Path(a.work).resolve() / "raw" / tid, cfg)
@@ -518,7 +520,13 @@ def advance(run: Run) -> None:
             sel += rest[: int(cfg["rotate_per_run"])]
         else:
             sel = cands
-        sel = sorted(set(sel), key=lambda p: (-eff_risk(p), p))[: int(cfg["review_budget"])]
+        sel = sorted(set(sel), key=lambda p: (-eff_risk(p), p))
+        if mode == "diff":
+            # The budget only trims the rotation: changed files are always reviewed.
+            keep = [p for p in sel if p in changed]
+            sel = keep + [p for p in sel if p not in changed][: max(0, int(cfg["review_budget"]) - len(keep))]
+        else:
+            sel = sel[: int(cfg["review_budget"])]
         run.queue["not_reviewed"] = sorted(set(cands) - set(sel))
 
         checklists = load_checklists()
@@ -658,6 +666,9 @@ def validate(stage: str, obj: dict, task: dict, run: Run) -> dict:
         if not isinstance(obj.get("purpose"), str):
             raise ValueError("missing 'purpose' string")
         risk = obj.get("risk", 1)
+        malice = obj.get("malice_suspect", False)
+        if not isinstance(malice, bool):
+            raise ValueError("'malice_suspect' must be a JSON boolean")
         return {
             "purpose": obj["purpose"][:200],
             "kind": obj.get("kind") if obj.get("kind") in KINDS else "other",
@@ -666,7 +677,7 @@ def validate(stage: str, obj: dict, task: dict, run: Run) -> dict:
             "sinks": [str(x)[:120] for x in obj.get("sinks", []) or []][:10],
             "risk": max(0, min(3, int(risk))) if str(risk).lstrip("-").isdigit() else 1,
             "injection_suspect": bool(obj.get("injection_suspect", False)),
-            "malice_suspect": bool(obj.get("malice_suspect", False)),
+            "malice_suspect": malice,
         }
     if stage == "review":
         if not isinstance(obj.get("candidates"), list):
@@ -896,13 +907,18 @@ def render_malice(run: Run, live: list, hdr: str, row) -> list[str]:
     """Separate verdict on whether the code itself acts against its users (backdoor, exfiltration, ...)."""
     mal = [f for f in live if f["category"] in MALICE_CATEGORIES]
     sus = sorted(p for p, r in load_index(run.target_dir).items() if r.get("malice_suspect"))
-    reviewed = {t["path"] for t in run.queue["tasks"].get("review", [])
-                if run.result(t["id"]) and "malicious-code" in t.get("checklists", [])}
+    chunks: dict[str, list[bool]] = {}
+    for t in run.queue["tasks"].get("review", []):
+        if "malicious-code" in t.get("checklists", []):
+            chunks.setdefault(t["path"], []).append(bool(run.result(t["id"])))
+    reviewed = [p for p, ok in chunks.items() if all(ok)]
+    partial = sorted(p for p, ok in chunks.items() if any(ok) and not all(ok))
     out = ["## Malicious-intent check", "",
            "Whether the code itself (its author, a dependency or CI) acts against its users: backdoors, hidden "
            "data exfiltration, credential harvesting, obfuscated payloads, install hooks, suspicious CI, malicious packages.", "",
            f"- Files checked with the malicious-code checklist this run: {len(reviewed)}"
            + (" (diff mode: changed files and the rotation only)" if run.meta["mode"] == "diff" else ""),
+           f"- Files only partly checked (some chunks failed): {len(partial)}" + (f" ({', '.join(f'`{p}`' for p in partial[:10])})" if partial else ""),
            f"- Files the index flags as possibly malicious: {len(sus)}",
            "- osv-scanner (known malicious packages): " + run.meta.get("tools", {}).get("osv-scanner", "not run"), ""]
     if mal:

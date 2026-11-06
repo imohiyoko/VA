@@ -27,13 +27,15 @@
 - **強制レビュー**: インストール・ビルド・コミット時に自動で動くファイルと依存の宣言（`package.json`、`setup.py`、
   `pyproject.toml`、`build.rs`、Makefile、Dockerfile、`conftest.py`、`go.mod`、`requirements*.txt`、`.husky/`、`.githooks/`、
   `.github/workflows/` など）は、要約の評価にかかわらず risk 2 以上
-- **diff モード**: 変更されたファイルは risk 0 でもすべてレビューする（悪意のある変更は無害に見えるファイルに紛れ込むため）
+- **diff モード**: 変更されたファイルは risk 0 でもすべてレビューする（悪意のある変更は無害に見えるファイルに紛れ込むため）。
+  `review_budget` はローテーション分だけを削り、変更ファイルは削らない
 - **依存**: osv-scanner の `MAL-` で始まる advisory は既知の悪意あるパッケージとして `malicious-dependency`（critical、`likely`）にする。
   到達性は問わない（インストールした時点で動くため）
 - **攻撃者**: これらの finding の `attacker` は `code-author`（コード・依存・CI の作者自身）
 - **トリアージ**: 「本当にそう動くか」と「目的から説明できず隠れているか（設定で切れない・文書がない・宛先が固定・中身が符号化）」を確認する。
-  文書化され設定で切れる機能（明示されたテレメトリ、更新確認など）は `false_positive`
-- **レポート**: `report.md` の「Malicious-intent check」節に、確認したファイル数・索引が疑ったファイル・該当 finding を、
+  機能の名目ではなく実際に送る中身と宛先で判断し、コードから「公言どおりの中身を公言どおりの宛先へ送るだけ」と読めるときだけ `false_positive`。
+  読み切れなければ `needs_info`
+- **レポート**: `report.md` の「Malicious-intent check」節に、確認したファイル数（全チャンク成功のもの。一部失敗は別に列挙）・索引が疑ったファイル・該当 finding を、
   ゼロ件でも必ず書く（見ていないのか、見て無かったのかを区別するため）
 
 ## 限界
