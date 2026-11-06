@@ -43,6 +43,13 @@
 - パス名が入口らしいファイル（route, controller, handler, api, auth, upload など）
 - `kind` が entry / ci / iac
 - AI 向けの指示を含むと判定されたファイル（`injection_suspect`、最優先）
+- 悪意のある動きの疑いがあると判定されたファイル（`malice_suspect`、最優先）
+- インストール・ビルド・コミット時に自動で動くファイルと依存の宣言（`package.json`、`setup.py`、`.github/workflows/` 等）
+
+## 2つの問い
+
+診断は「外の攻撃者が悪用できるか（脆弱性）」に加えて、「コード自身が利用者を裏切っていないか（悪意）」を問う。
+後者は `checklists/malicious-code.md`（常に適用）が担い、レポートには専用の節が付く（`08-malicious-intent.md`）。
 
 ## ツール
 

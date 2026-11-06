@@ -21,6 +21,12 @@
 `evidence`, `rationale`, `fix`, `source`(llm/semgrep/gitleaks/osv-scanner), `fp_reason`, `first_seen`,
 `triage_model`, `carried_over`(diff モードで再確認していない継続分)
 
+## report.md の構成
+
+Summary → **Malicious-intent check**（悪意の有無。確認したファイル数・索引が疑ったファイル・該当 finding。ゼロ件でも必ず出す）
+→ New findings → Continuing findings → Resolved → プロンプトインジェクションの疑い → Not covered。
+Malicious-intent check に載る finding は New / Continuing の表にも載る。
+
 ## fingerprint
 
 `sha256(category + ":" + path + ":" + 空白を除いた該当行)` の先頭16桁。行番号を含めないので、行がずれても同じ ID になる。

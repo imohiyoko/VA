@@ -10,6 +10,8 @@
 - シークレットがフォーク PR から参照できる構成、`ACTIONS_STEP_DEBUG` 等でのログ漏洩
 - self-hosted runner を public リポジトリで使用
 
+- ワークフロー自体が悪意を持っていないか（シークレットの外部送信、目的外の外部スクリプト実行）は `08-malicious-intent.md` の `suspicious-ci`
+
 ## その他
 - Dockerfile: `latest` タグ、root 実行、`curl | sh`、シークレットの `ARG`/`ENV` 埋め込み
 - IaC（Terraform / k8s / CloudFormation）: 公開バケット、`0.0.0.0/0` の管理ポート、過剰な IAM、特権コンテナ
