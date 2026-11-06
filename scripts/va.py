@@ -40,7 +40,12 @@ TAGS = [
 KINDS = {"entry", "lib", "config", "test", "ci", "iac", "docs", "build", "other"}
 SEVERITIES = ["critical", "high", "medium", "low", "info"]
 CONFIDENCE = {"high", "medium", "low"}
-ATTACKERS = {"unauthenticated", "user", "admin", "local", "ci-committer", "unknown"}
+# "code-author": the threat is the code itself (its author, a dependency or a CI step), not an outside attacker.
+ATTACKERS = {"unauthenticated", "user", "admin", "local", "ci-committer", "code-author", "unknown"}
+# Categories of the malicious-code checklist (and malicious packages from osv-scanner). The report lists them
+# in their own section: "is this system acting against its users?" is a separate question from "is it vulnerable?".
+MALICE_CATEGORIES = {"backdoor", "data-exfiltration", "credential-harvesting", "obfuscated-payload",
+                     "malicious-install-hook", "suspicious-ci", "malicious-dependency", "destructive-payload"}
 STATUSES = {"confirmed", "likely", "needs_info", "false_positive"}
 STAGES = ["summarize", "review", "triage"]
 
@@ -83,9 +88,16 @@ LANG_BY_EXT = {
     ".sql": "sql", ".json": "json", ".toml": "toml", ".ini": "ini", ".xml": "xml",
     ".gradle": "gradle", ".properties": "properties", ".conf": "conf",
 }
-LANG_BY_NAME = {"Dockerfile": "dockerfile", "Makefile": "make", "Jenkinsfile": "groovy", "Procfile": "procfile"}
+LANG_BY_NAME = {"Dockerfile": "dockerfile", "Makefile": "make", "Jenkinsfile": "groovy", "Procfile": "procfile",
+                # dependency manifests without a known extension: indexed so the malicious-code checklist sees them
+                "go.mod": "gomod", "requirements.txt": "pip-requirements", "Gemfile": "ruby", ".npmrc": "npmrc"}
 # Path hints used as a floor for risk, so a poisoned or wrong summary cannot hide an entry point.
 ENTRY_HINT = re.compile(r"(route|controller|handler|api|view|endpoint|middleware|auth|login|session|webhook|upload|admin)", re.I)
+# Files that run automatically on install / build / test / commit, or declare dependencies: the usual place for
+# malicious code, so a summary that rates them harmless cannot keep them out of review.
+MALICE_HINT = re.compile(r"(^|/)(package\.json|setup\.py|setup\.cfg|pyproject\.toml|build\.rs|Makefile|Dockerfile|"
+                         r"conftest\.py|[^/]*\.gemspec|build\.gradle(\.kts)?|go\.mod|composer\.json|requirements[^/]*\.txt|Gemfile|\.npmrc|"
+                         r"(pre|post)?install[^/]*)$|(^|/)(\.husky|\.githooks|\.github/workflows)/", re.I)
 
 
 # ----------------------------------------------------------------------------- utils
@@ -187,6 +199,8 @@ def lang_of(path: str) -> str | None:
         return LANG_BY_NAME.get(name, "dockerfile")
     if name.startswith(".env"):
         return "dotenv"
+    if re.search(r"(^|/)(\.husky|\.githooks)/[^/.]+$", path):
+        return "shell"   # extensionless git hooks run on every commit
     return LANG_BY_EXT.get(os.path.splitext(name)[1].lower())
 
 
@@ -354,6 +368,17 @@ def run_tools(src: Path, raw: Path, cfg: dict) -> tuple[dict, list[dict]]:
                 name = pkg.get("package", {}).get("name", "")
                 ver = pkg.get("package", {}).get("version", "")
                 for v in pkg.get("vulnerabilities", []):
+                    if str(v.get("id", "")).startswith("MAL-"):
+                        # OSV "MAL-" entries are known malicious package versions, not bugs: no reachability question.
+                        cands.append({
+                            "source": "osv-scanner", "category": "malicious-dependency",
+                            "title": f"Known malicious package {name}@{ver}: {v.get('id')}"[:80],
+                            "path": path, "line": 0, "severity": "critical", "confidence": "high",
+                            "attacker": "code-author", "status": "likely",
+                            "evidence": (v.get("summary") or "")[:300],
+                            "fix": "Remove the package, rotate secrets on machines that installed it.", "skip_triage": True,
+                        })
+                        continue
                     sev = str(v.get("database_specific", {}).get("severity", "")).lower()
                     sev = {"moderate": "medium"}.get(sev, sev)
                     cands.append({
@@ -437,7 +462,9 @@ def cmd_plan(a) -> None:
     changed = sorted(p for p, f in files.items() if index.get(p, {}).get("blob") != f["blob"])
     deleted = sorted(set(index) - set(files))
 
-    tasks = [{"id": f"s-{hashlib.sha1(p.encode()).hexdigest()[:10]}", "path": p} for p in changed]
+    # Unchanged files indexed before the malice_suspect field existed are summarized once more (one time only).
+    stale = sorted(p for p in files if p not in changed and "malice_suspect" not in index.get(p, {}))
+    tasks = [{"id": f"s-{hashlib.sha1(p.encode()).hexdigest()[:10]}", "path": p} for p in changed + stale]
 
     tool_status, tool_cands = ({}, []) if a.no_tools else run_tools(src, Path(a.work).resolve() / "raw" / tid, cfg)
 
@@ -472,7 +499,9 @@ def advance(run: Run) -> None:
             risk = int(r.get("risk", 0))
             if ENTRY_HINT.search(path):
                 risk = max(risk, 2)
-            if r.get("injection_suspect"):
+            if MALICE_HINT.search(path):
+                risk = max(risk, 2)
+            if r.get("injection_suspect") or r.get("malice_suspect"):
                 risk = 3
             if r.get("kind") in {"entry", "ci", "iac"}:
                 risk = max(risk, 2)
@@ -480,7 +509,9 @@ def advance(run: Run) -> None:
 
         cands = [p for p in index if eff_risk(p) >= 1]
         if mode == "diff":
-            sel = [p for p in cands if p in changed]
+            # Every changed file is reviewed, even risk 0: a malicious change can hide in a file that looks harmless,
+            # and the always-on checklists (general, malicious-code) are cheap for such files.
+            sel = [p for p in index if p in changed]
             # rotating sweep of high-risk unchanged files, least recently reviewed first
             rest = sorted((p for p in cands if p not in changed and eff_risk(p) >= 2),
                           key=lambda p: (prev_index.get(p, {}).get("reviewed_at") or "", -eff_risk(p)))
@@ -568,7 +599,7 @@ def merged_index(run: Run) -> dict[str, dict]:
             res = run.result(by_path[path]) or {"purpose": "(summary failed)", "kind": "other", "tags": [], "risk": 2}
             lines = len((run.src / path).read_text(encoding="utf-8", errors="replace").splitlines())
             out[path] = {"path": path, "blob": f["blob"], "lang": f["lang"], "lines": lines,
-                         **{k: res.get(k) for k in ("purpose", "kind", "tags", "entry_points", "sinks", "risk", "injection_suspect")},
+                         **{k: res.get(k) for k in ("purpose", "kind", "tags", "entry_points", "sinks", "risk", "injection_suspect", "malice_suspect")},
                          "model": run.meta["model"], "va_version": run.meta["va_version"], "updated": run.path.name,
                          "reviewed_at": prev.get(path, {}).get("reviewed_at")}
         else:
@@ -635,6 +666,7 @@ def validate(stage: str, obj: dict, task: dict, run: Run) -> dict:
             "sinks": [str(x)[:120] for x in obj.get("sinks", []) or []][:10],
             "risk": max(0, min(3, int(risk))) if str(risk).lstrip("-").isdigit() else 1,
             "injection_suspect": bool(obj.get("injection_suspect", False)),
+            "malice_suspect": bool(obj.get("malice_suspect", False)),
         }
     if stage == "review":
         if not isinstance(obj.get("candidates"), list):
@@ -860,6 +892,28 @@ def render_changes(run: Run, index: dict) -> str:
     return "\n".join(out) + "\n"
 
 
+def render_malice(run: Run, live: list, hdr: str, row) -> list[str]:
+    """Separate verdict on whether the code itself acts against its users (backdoor, exfiltration, ...)."""
+    mal = [f for f in live if f["category"] in MALICE_CATEGORIES]
+    sus = sorted(p for p, r in load_index(run.target_dir).items() if r.get("malice_suspect"))
+    reviewed = {t["path"] for t in run.queue["tasks"].get("review", [])
+                if run.result(t["id"]) and "malicious-code" in t.get("checklists", [])}
+    out = ["## Malicious-intent check", "",
+           "Whether the code itself (its author, a dependency or CI) acts against its users: backdoors, hidden "
+           "data exfiltration, credential harvesting, obfuscated payloads, install hooks, suspicious CI, malicious packages.", "",
+           f"- Files checked with the malicious-code checklist this run: {len(reviewed)}"
+           + (" (diff mode: changed files and the rotation only)" if run.meta["mode"] == "diff" else ""),
+           f"- Files the index flags as possibly malicious: {len(sus)}",
+           "- osv-scanner (known malicious packages): " + run.meta.get("tools", {}).get("osv-scanner", "not run"), ""]
+    if mal:
+        out += ["**Signs found. Check these by hand before trusting this repository.**", "", hdr] + [row(f) for f in mal]
+    else:
+        out.append("No signs of malicious intent were found in the files checked.")
+    if sus:
+        out += ["", "Flagged by the index (reviewed with maximum priority):", ""] + [f"- `{p}`" for p in sus]
+    return out + [""]
+
+
 def render_report(run: Run, findings: list, prev: dict, resolved: list) -> str:
     m = run.meta
     live = [f for f in findings if f["status"] != "false_positive"]
@@ -881,7 +935,9 @@ def render_report(run: Run, findings: list, prev: dict, resolved: list) -> str:
            + (f" (escalation `{m['escalate_model']}`)" if m.get("escalate_model") else ""),
            f"- LLM tasks {m['usage']['tasks']} run, {m['usage'].get('reused', 0)} reused, {m['usage']['failed']} failed / cost ≈ ${m['usage']['cost_usd']}", "",
            "## Summary", "", f"- New: {counts(new)}", f"- Continuing: {counts(cont)}", f"- Resolved: {len(resolved)}",
-           f"- Rejected as false positive: {len(fps)}", ""]
+           f"- Rejected as false positive: {len(fps)}",
+           f"- Signs of malicious intent: {len([f for f in live if f['category'] in MALICE_CATEGORIES])}", ""]
+    out += render_malice(run, live, hdr, row)
     for title, fs in (("New findings", new), ("Continuing findings", cont)):
         out += [f"## {title}", ""]
         out += ([hdr] + [row(f) for f in fs]) if fs else ["None."]

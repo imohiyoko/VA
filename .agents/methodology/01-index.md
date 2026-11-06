@@ -8,7 +8,7 @@
 {"path": "src/api/users.ts", "blob": "<git blob sha>", "lang": "typescript", "lines": 182,
  "purpose": "...", "kind": "entry", "tags": ["http-input", "db", "auth"],
  "entry_points": ["GET /users/:id"], "sinks": ["knex.raw in updateUser"], "risk": 3,
- "injection_suspect": false, "model": "claude-haiku-5-5", "va_version": "0.1.0",
+ "injection_suspect": false, "malice_suspect": false, "model": "claude-haiku-5-5", "va_version": "0.1.0",
  "updated": "<run id>", "reviewed_at": "<run id>"}
 ```
 

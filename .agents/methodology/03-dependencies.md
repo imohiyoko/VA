@@ -10,3 +10,4 @@
 4. メンテナンス停止・タイポスクワッティングが疑われるパッケージ名、
    Git URL やローカルパス指定の依存、バージョン未固定（`*`, `latest`）を記録する
 5. postinstall 等のインストールスクリプトを持つ依存は名前だけ記録する（実行しない）
+6. osv-scanner の `MAL-` advisory（既知の悪意あるパッケージ）は到達性を問わず `malicious-dependency` にする（`08-malicious-intent.md`）

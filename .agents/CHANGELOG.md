@@ -8,6 +8,21 @@
 
 上流 PR では必ずこのファイルに1行追記し、`VERSION` を上げる。
 
+## 0.3.0 — 2026-11-06
+
+- 「悪意の有無」の観点を追加。脆弱性（外の攻撃者が悪用できるか）とは別に、コード自身（作者・依存・CI）が
+  利用者を裏切っていないかを見る（`methodology/08-malicious-intent.md`）。
+  - チェックリスト `malicious-code`（常に適用）: backdoor / data-exfiltration / credential-harvesting / obfuscated-payload /
+    malicious-install-hook / suspicious-ci / malicious-dependency / destructive-payload
+  - 要約に `malice_suspect` を追加（立てば risk 3）。この項目を持たない古い索引は 1 回だけ要約し直す
+  - インストール・ビルド・コミット時に動くファイルと依存の宣言を強制レビュー（risk 2 以上）。`go.mod`、`requirements.txt`、
+    `Gemfile`、`.npmrc`、拡張子のない git フックを索引に入れる
+  - diff モードでは変更ファイルを risk 0 でもすべてレビューする
+  - osv-scanner の `MAL-` advisory を `malicious-dependency`（critical、likely）にする
+  - attacker に `code-author` を追加。レビュー・トリアージのプロンプトに悪意の観点の判定基準を追加
+  - `report.md` に「Malicious-intent check」節（ゼロ件でも出す）と Summary の件数を追加
+- 検出結果が変わるので MINOR（次の run はフルスキャン）。
+
 ## 0.2.0 — 2026-10-30
 
 - `osv-scanner` を `--no-ignore` で実行する。対象の clone が運用リポジトリの `work/`（.gitignore 対象）にあると
