@@ -20,7 +20,7 @@ VA (public, 共通基盤)  ──upstream──▶  運用リポジトリ (priva
 | `AGENTS.md` / `CLAUDE.md` | エージェント共通の指示 / Claude Code 用入口（`@AGENTS.md`） |
 | `.agents/methodology/` | 手法の説明（パイプライン、索引、トリアージ基準、報告形式） |
 | `.agents/checklists/` | レビュー観点（単一の情報源。ファイルのタグで自動選択） |
-| `.agents/prompts/tasks/` | 軽量モデル向けタスクプロンプト（summarize / review / triage） |
+| `.agents/prompts/tasks/` | 軽量モデル向けタスクプロンプト（summarize / review / crosscheck / triage） |
 | `.agents/prompts/` | retrospective・upstream-proposer のプロンプト |
 | `.agents/model-profiles/` | モデルごとの傾向と補正（`- [review] ...` の行がプロンプトに自動注入される） |
 | `.agents/learning/` | 学習の分類ルール、上流提案ポリシー |
