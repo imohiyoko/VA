@@ -617,8 +617,9 @@ def advance(run: Run) -> None:
 # exists, not that it is short, so the script does the cross-file part: it collects the permission-like literals defined
 # anywhere, finds blocks that list several of them, and hands one block plus the defined items it lacks to a small model.
 
-# A line that opens a new collection (`NAME = [`, `var x = map[...]{`, `PRIVILEGED = frozenset({`): a list boundary.
-OPENER = re.compile(r"""[A-Za-z_][\w.]*\s*(?::=|=)\s*[^"'`=]*[\[{(]\s*$""")
+# A line that opens a new collection (`NAME = [`, `var x = map[...]{`, `PRIVILEGED = frozenset({`), or a one-line
+# collection (`NAME = ["a:b", "c:d"]`, `x := []string{"a:b"}`): a list boundary. A call such as `x = f("a:b")` is not.
+OPENER = re.compile(r"""[A-Za-z_][\w.]*\s*(?::=|=)\s*(?:[^"'`=]*[\[{(]\s*$|[^"'`=(]*(?:\(\s*)?[\[{])""")
 STR_LITERAL = re.compile(r"""["'`]([^"'`\n]{1,80})["'`]""")
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # NAME = "x:y" / NAME Type = "x:y" / NAME := Perm("x:y") / NAME: "x:y", ending at the literal's opening quote
@@ -729,6 +730,32 @@ def find_lists(defs: dict, idents: dict, texts: dict, deflines: set = frozenset(
                 out.append({"path": path, "start": start, "end": end, "kind": kind,
                             "items": sorted(have), "missing": missing})
     return out
+
+
+def crosscheck_selftest() -> list[str]:
+    """Regression checks for list boundaries, on synthetic lines (no target code)."""
+    defs = {f"{r}:read": "x" for r in ("aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg")}
+    one = ['    "aaa:read",', '    "bbb:read",', '    "ccc:read",']
+    two = ['    "ddd:read",', '    "eee:read",', '    "fff:read",']
+    cases = {
+        "multi-line lists side by side": ["PRIVILEGED = ["] + one + ["]", "DEFAULT = ["] + two + ["]"],
+        "one-line lists side by side": ['PRIVILEGED = ["aaa:read", "bbb:read", "ccc:read"]',
+                                        'DEFAULT = ["ddd:read", "eee:read", "fff:read"]'],
+        "one-line Go lists side by side": ['privileged := []string{"aaa:read", "bbb:read", "ccc:read"}',
+                                           'def := []string{"ddd:read", "eee:read", "fff:read"}'],
+        "one-line sets side by side": ['PRIVILEGED = frozenset({"aaa:read", "bbb:read", "ccc:read"})',
+                                       'DEFAULT = frozenset({"ddd:read", "eee:read", "fff:read"})'],
+    }
+    errs = []
+    for name, lines in cases.items():
+        got = sorted(tuple(b["items"]) for b in find_lists(defs, {}, {"src/x.py": lines}) if b["kind"] == "permission")
+        want = [("aaa:read", "bbb:read", "ccc:read"), ("ddd:read", "eee:read", "fff:read")]
+        if got != want:
+            errs.append(f"crosscheck selftest ({name}): lists {got}, expected {want}")
+    calls = ['x = f("aaa:read")', 'y = f("bbb:read")', 'z = f("ccc:read")']
+    if len(find_lists(defs, {}, {"src/x.py": calls})) != 1:
+        errs.append("crosscheck selftest (calls on nearby lines): expected one block")
+    return errs
 
 
 XC_MISSING_PER_TASK = 80
@@ -1396,6 +1423,7 @@ def cmd_validate(a) -> None:
                 errs.append(f"prompts/tasks/{name}: missing placeholder {{{{{k}}}}}")
     if not re.fullmatch(r"\d+\.\d+\.\d+", va_version()):
         errs.append(".agents/VERSION is not SemVer")
+    errs += crosscheck_selftest()
     for e in errs:
         print("ERROR", e)
     print(f"{len(ids)} checklists, {len(cats_all)} categories, {len(errs)} errors")

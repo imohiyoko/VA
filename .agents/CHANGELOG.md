@@ -20,6 +20,7 @@
     （`prompts/tasks/check-list-gap.md`）。`decides_access` かつ `missing` ありで `authz-list-gap` の候補になり、通常どおり triage する。
     同じ一覧・同じ漏れ・同じ使われ方は前回の判定を再利用、1 run の上限は `crosscheck_budget`（既定 30）。漏れが 80 件を超える一覧は
     分けて全件判定し、1 件にまとめる。fingerprint に漏れた項目を含める。一覧の使われ方を triage にも渡す
+    一覧の境界は、複数行の一覧の開始行と 1 行の一覧（`NAME = [...]`、`x := []string{...}`）で分ける。`validate` が境界の回帰を確かめる
   - triage に `authz-list-gap` / `privilege-escalation` の判定基準（一覧・確かめが付与の判断に使われ、緩い側に倒れるか）を追加
   - `report.md` に「Privilege-escalation check」節（ゼロ件でも出す）と Summary の件数、該当 finding に手での再現手順の雛形
     （付与の前に 403、付与の後に 200。VA は対象を実行しない）を追加
