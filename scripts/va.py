@@ -757,7 +757,8 @@ def crosscheck_tasks(run: Run, cfg: dict) -> list[dict]:
     for b in blocks[:budget]:
         lines = texts[b["path"]]
         # the same window the prompt shows (list +-15 lines), so a change next to the list is judged again
-        block_text = re.sub(r"\s+", "", "\n".join(lines[max(0, b["start"] - 16):b["end"] + 15]))
+        # (indentation kept: in Python it decides which branch a line belongs to)
+        block_text = "\n".join(l.rstrip() for l in lines[max(0, b["start"] - 16):b["end"] + 15])
         usages = list_usages(texts, b, lines)
         # A long list of missing items is split so every item is judged (one task per part).
         parts = [b["missing"][i:i + XC_MISSING_PER_TASK] for i in range(0, len(b["missing"]), XC_MISSING_PER_TASK)]
@@ -798,7 +799,7 @@ def list_usages(texts: dict, b: dict, lines: list[str]) -> list[str]:
                 continue
             if word.search(line):
                 # the line before and the two after too: the condition and what it does are often on separate lines
-                out.append("\n".join(f"{path}:{j}: {ls[j - 1].strip()[:160]}"
+                out.append("\n".join(f"{path}:{j}: {ls[j - 1].rstrip()[:160]}"
                                       for j in range(max(1, i - 1), min(len(ls), i + 2) + 1)))
                 if len(out) >= 8:
                     return out
