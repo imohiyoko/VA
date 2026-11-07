@@ -748,7 +748,8 @@ def crosscheck_tasks(run: Run, cfg: dict) -> list[dict]:
     tasks = []
     for b in blocks[:budget]:
         lines = texts[b["path"]]
-        block_text = re.sub(r"\s+", "", "\n".join(lines[b["start"] - 1:b["end"]]))
+        # the same window the prompt shows (list +-15 lines), so a change next to the list is judged again
+        block_text = re.sub(r"\s+", "", "\n".join(lines[max(0, b["start"] - 16):b["end"] + 15]))
         usages = list_usages(texts, b, lines)
         # A long list of missing items is split so every item is judged (one task per part).
         parts = [b["missing"][i:i + XC_MISSING_PER_TASK] for i in range(0, len(b["missing"]), XC_MISSING_PER_TASK)]
