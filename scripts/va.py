@@ -789,7 +789,9 @@ def list_usages(texts: dict, b: dict, lines: list[str]) -> list[str]:
             if path == b["path"] and b["start"] - 3 <= i <= b["end"]:
                 continue
             if word.search(line):
-                out.append(f"{path}:{i}: {line.strip()[:160]}")
+                # the line before and the two after too: the condition and what it does are often on separate lines
+                out.append("\n".join(f"{path}:{j}: {ls[j - 1].strip()[:160]}"
+                                      for j in range(max(1, i - 1), min(len(ls), i + 2) + 1)))
                 if len(out) >= 8:
                     return out
     return out
