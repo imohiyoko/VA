@@ -18,14 +18,15 @@
 ## findings.json の項目
 
 `fingerprint`, `category`, `title`, `severity`, `status`, `confidence`, `location{path,line}`, `attacker`,
-`evidence`, `rationale`, `fix`, `source`(llm/semgrep/gitleaks/osv-scanner), `fp_reason`, `first_seen`,
+`evidence`, `rationale`, `fix`, `source`(llm/crosscheck/semgrep/gitleaks/osv-scanner), `fp_reason`, `first_seen`,
 `triage_model`, `carried_over`(diff モードで再確認していない継続分)
 
 ## report.md の構成
 
 Summary → **Malicious-intent check**（悪意の有無。確認したファイル数・索引が疑ったファイル・該当 finding。ゼロ件でも必ず出す）
-→ New findings → Continuing findings → Resolved → プロンプトインジェクションの疑い → Not covered。
-Malicious-intent check に載る finding は New / Continuing の表にも載る。
+→ **Privilege-escalation check**（権限らしいリテラルの数、突き合わせた一覧の数、`privilege-escalation` / `authz-list-gap` の finding。ゼロ件でも出す）
+→ New findings → Continuing findings → Resolved → プロンプトインジェクションの疑い → Not covered。Malicious-intent check と Privilege-escalation check に載る finding は New / Continuing の表にも載る。
+`privilege-escalation` / `authz-list-gap` の詳細には、手での再現手順（付与の前に 403、付与の後に 200）の雛形が付く（`09-privilege-escalation.md`）。
 
 ## fingerprint
 
@@ -36,7 +37,8 @@ Malicious-intent check に載る finding は New / Continuing の表にも載る
 
 - 新規: 前回の findings に無い
 - 継続: 前回にもある。diff モードで今回レビューしなかったファイルのものは `carried_over` として引き継ぐ
-- 解消: 前回あって今回無く、かつそのファイルを今回レビューした（またはファイルが消えた、ツール由来の指摘）
+- 解消: 前回あって今回無く、かつそのファイルを今回レビューした（またはファイルが消えた、ツール由来の指摘、
+  crosscheck 由来は、そのファイルの一覧を今回すべて判定し終えたときだけ。上限超え・失敗があれば引き継ぐ）
 
 ## 人による判定（state.json）
 

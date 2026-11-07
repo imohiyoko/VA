@@ -45,6 +45,8 @@ GitHub Actions（`va-audit`）ではなく、Claude Code などのエージェ�
 
 6. **報告**（親）: 診断した target ごとの種別（初回 / 差分）と重大度別の新規・継続・解消件数、critical / high の全タイトルと場所、
    スキップした target と理由、Not covered と品質上の注意。シークレットの値は書かない（先頭4文字＋長さ＋場所のみ）。
+   report.md の「Privilege-escalation check」節の finding（`privilege-escalation` / `authz-list-gap`）は重大度に関係なく全件書き、
+   再現の確かめ（付与の前に 403、付与の後に 200）は対象の所有者が自分の環境で行うものとして添える。未修正の詳細は公開の場に書かない。
 
 ## サブエージェントへの指示
 
@@ -62,6 +64,7 @@ GitHub Actions（`va-audit`）ではなく、Claude Code などのエージェ�
 4. python3 scripts/va.py report --run "$RUN"
 5. rm -rf "$SRC" してから、.agents/prompts/retrospective.md に従って retrospective を行う（operator/ 以下だけに書く）。
 6. 親に次を返す: run のパス、種別、重大度別の新規・継続・解消件数、critical/high/medium のタイトルと場所、
+   Privilege-escalation check（突き合わせた一覧の数と該当 finding 全件）、
    meta.json の tools の状態、失敗したタスク数、品質上の注意。シークレットの値は書かない。
 ```
 

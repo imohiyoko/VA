@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """VA pipeline: deterministic orchestration so small models only do small, schema-checked tasks.
 
-Stages per run:  summarize (index files) -> review (file x checklist) -> triage (one candidate) -> report
-Everything except the three LLM task types is done here, deterministically.
+Stages per run:  summarize (index files) -> review (file x checklist) -> crosscheck (one classification list)
+                 -> triage (one candidate) -> report
+Everything except the four LLM task types is done here, deterministically.
 
 Python >= 3.11, standard library only.
 """
@@ -39,6 +40,7 @@ TAGS = [
 ]
 KINDS = {"entry", "lib", "config", "test", "ci", "iac", "docs", "build", "other"}
 SEVERITIES = ["critical", "high", "medium", "low", "info"]
+SEV_ORDER = {s: i for i, s in enumerate(SEVERITIES)}
 CONFIDENCE = {"high", "medium", "low"}
 # "code-author": the threat is the code itself (its author, a dependency or a CI step), not an outside attacker.
 ATTACKERS = {"unauthenticated", "user", "admin", "local", "ci-committer", "code-author", "unknown"}
@@ -47,7 +49,7 @@ ATTACKERS = {"unauthenticated", "user", "admin", "local", "ci-committer", "code-
 MALICE_CATEGORIES = {"backdoor", "data-exfiltration", "credential-harvesting", "obfuscated-payload",
                      "malicious-install-hook", "suspicious-ci", "malicious-dependency", "destructive-payload"}
 STATUSES = {"confirmed", "likely", "needs_info", "false_positive"}
-STAGES = ["summarize", "review", "triage"]
+STAGES = ["summarize", "review", "crosscheck", "triage"]
 
 DEFAULTS = {
     "model": "claude-haiku-5-5",
@@ -66,6 +68,9 @@ DEFAULTS = {
     "rotate_per_run": 20,
     "semgrep_config": "p/default",
     "exclude": [],
+    # crosscheck: permission-like string literals ("<resource>:<action>"). Override with a regex that has one group.
+    "perm_pattern": "",
+    "crosscheck_budget": 30,
 }
 
 DEFAULT_EXCLUDE = [
@@ -98,6 +103,17 @@ ENTRY_HINT = re.compile(r"(route|controller|handler|api|view|endpoint|middleware
 MALICE_HINT = re.compile(r"(^|/)(package\.json|setup\.py|setup\.cfg|pyproject\.toml|build\.rs|Makefile|Dockerfile|"
                          r"conftest\.py|[^/]*\.gemspec|build\.gradle(\.kts)?|go\.mod|composer\.json|requirements[^/]*\.txt|Gemfile|\.npmrc|"
                          r"(pre|post)?install[^/]*)$|(^|/)(\.husky|\.githooks|\.github/workflows)/", re.I)
+# Paths that usually hold roles, permissions and their checks: reviewed with the privilege-escalation checklist
+# even when the summary forgot the "auth" tag.
+PRIV_HINT = re.compile(r"(role|perm|privilege|grant|rbac|\bacls?\b|polic|scope|capabilit|entitle|authz)", re.I)
+# "<resource>:<action>" as a quoted literal, e.g. "reports:read". Values that only look like it are dropped below.
+PERM_LITERAL = r"""["'`]([a-z][a-z0-9_-]{1,40}:[a-z*][a-z0-9_*.-]{0,40})["'`]"""
+NOT_PERM_PREFIX = {"http", "https", "mailto", "data", "urn", "file", "ftp", "ws", "wss", "tcp", "udp", "unix", "git",
+                   "ssh", "redis", "postgres", "postgresql", "mysql", "mongodb", "sqlite", "javascript", "localhost",
+                   "sha1", "sha256", "sha384", "sha512", "md5", "blake2b", "base64", "hex", "utf-8", "text", "image",
+                   "application", "node", "npm", "docker", "type", "error", "warning", "info", "debug"}
+TEST_PATH = re.compile(r"(^|/)(tests?|spec|specs|__tests__|testdata|fixtures?|mocks?|e2e)/|_test\.go$|\.(test|spec)\.[a-z]+$|"
+                       r"(^|/)test_[^/]*\.py$|_test\.py$", re.I)
 
 
 # ----------------------------------------------------------------------------- utils
@@ -501,7 +517,7 @@ def advance(run: Run) -> None:
             risk = int(r.get("risk", 0))
             if ENTRY_HINT.search(path):
                 risk = max(risk, 2)
-            if MALICE_HINT.search(path):
+            if MALICE_HINT.search(path) or PRIV_HINT.search(path):
                 risk = max(risk, 2)
             if r.get("injection_suspect") or r.get("malice_suspect"):
                 risk = 3
@@ -536,6 +552,8 @@ def advance(run: Run) -> None:
             tags = set(rec.get("tags", []))
             if rec.get("kind") == "entry" or ENTRY_HINT.search(path):
                 tags.add("http-input")
+            if PRIV_HINT.search(path):
+                tags.add("auth")
             chosen = [c["id"] for c in checklists
                       if ("always" in c.get("tags", []) or tags & set(c.get("tags", [])))
                       and ("any" in c.get("langs", ["any"]) or rec["lang"] in c.get("langs", []))]
@@ -548,7 +566,11 @@ def advance(run: Run) -> None:
         tasks["review"] = rtasks
         run.save()
 
-    if "review" in tasks and "triage" not in tasks and not run.pending("review"):
+    if "review" in tasks and "crosscheck" not in tasks and not run.pending("review"):
+        tasks["crosscheck"] = crosscheck_tasks(run, cfg)
+        run.save()
+
+    if "crosscheck" in tasks and "triage" not in tasks and not run.pending("crosscheck"):
         state = rjson(run.target_dir / "state.json", {"suppressed": {}})
         suppressed = state.get("suppressed", {})
         cands, seen = [], set()
@@ -556,9 +578,10 @@ def advance(run: Run) -> None:
         for t in tasks["review"]:
             for c in (run.result(t["id"]) or {}).get("candidates", []):
                 allc.append({**c, "path": t["path"], "source": "llm"})
+        allc += crosscheck_merged(run, tasks["crosscheck"])
         for c in allc:
             line_text = line_at(run.src / c["path"], c.get("line", 0)) or c.get("title", "")
-            fp = fingerprint(c["category"], c["path"], line_text)
+            fp = fingerprint(c["category"], c["path"], line_text + ("|" + c["fp_extra"] if c.get("fp_extra") else ""))
             if fp in seen:
                 continue
             seen.add(fp)
@@ -584,6 +607,271 @@ def advance(run: Run) -> None:
                             "model": esc_model if esc_model and c.get("severity") in esc_when else None}
                            for c in cands if not c.get("skip_triage") and not c.get("suppressed") and not c.get("reused_triage")]
         run.save()
+
+
+# ----------------------------------------------------------------------------- crosscheck (definitions vs lists)
+#
+# A list that classifies permissions ("privileged", "internal", "reserved", "not allowed in custom roles", ...) is often
+# written by hand, apart from where the permissions are defined. When a new permission is defined and the list is not
+# updated, the missing permission silently gets the permissive treatment. Reviewing one file at a time shows that the list
+# exists, not that it is short, so the script does the cross-file part: it collects the permission-like literals defined
+# anywhere, finds blocks that list several of them, and hands one block plus the defined items it lacks to a small model.
+
+# A line that opens a new collection (`NAME = [`, `var x = map[...]{`, `PRIVILEGED = frozenset({`), or a one-line
+# collection (`NAME = ["a:b", "c:d"]`, `x := []string{"a:b"}`): a list boundary. A call such as `x = f("a:b")` is not.
+OPENER = re.compile(r"""[A-Za-z_][\w.]*\s*(?::=|=)\s*(?:[^"'`=]*[\[{(]\s*$|[^"'`=(]*(?:\(\s*)?[\[{])""")
+STR_LITERAL = re.compile(r"""["'`]([^"'`\n]{1,80})["'`]""")
+IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# NAME = "x:y" / NAME Type = "x:y" / NAME := Perm("x:y") / NAME: "x:y", ending at the literal's opening quote
+ASSIGN = re.compile(r"""([A-Za-z_][A-Za-z0-9_]*)(?:\s+[A-Za-z_][\w.]*)?\s*(:=|=|:)\s*(?:[A-Za-z_][\w.]*\s*\(\s*)?["'`]$""")
+DECL_WORDS = {"export", "const", "var", "let", "final", "static", "public", "private", "protected", "readonly", "val",
+              "def", "pub", "internal", "type"}
+LIST_NAME = re.compile(r"""([A-Za-z_][A-Za-z0-9_]*)\s*(?::=|=|:|\bin\b)""")
+
+
+def assigned_name(seg: str) -> tuple[str, str] | None:
+    """(name, operator) assigned the literal whose opening quote ends seg, skipping declaration keywords."""
+    m, pos = ASSIGN.search(seg), 0
+    while m and m.group(1) in DECL_WORDS:
+        pos = m.start(1) + len(m.group(1))
+        m = ASSIGN.search(seg, pos)
+    return (m.group(1), m.group(2)) if m else None
+
+
+def perm_definitions(run: Run, cfg: dict) -> tuple[dict, dict, dict, set]:
+    """(perm -> first "path:line", identifier -> perm, path -> lines, {(path, line)} that define a constant)."""
+    pat = re.compile(cfg.get("perm_pattern") or PERM_LITERAL)
+    defs, idents, texts, deflines, clash = {}, {}, {}, set(), set()
+    for path, f in sorted(run.queue["files"].items()):
+        if TEST_PATH.search(path) or f["lang"] in {"dotenv"}:
+            continue
+        try:
+            lines = (run.src / path).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        hit = False
+        for i, line in enumerate(lines, 1):
+            for m in pat.finditer(line):
+                v = m.group(1)
+                if v.split(":", 1)[0].lower() in NOT_PERM_PREFIX and not cfg.get("perm_pattern"):
+                    continue
+                hit = True
+                defs.setdefault(v, f"{path}:{i}")
+                got = assigned_name(line[:m.start() + 1])
+                if got:
+                    name, op = got
+                    if name in clash:
+                        pass
+                    elif idents.setdefault(name, v) != v:
+                        clash.add(name)   # same name, different permission in another scope: do not guess
+                    if op != ":":
+                        # `NAME = "x:y"` defines a constant. `KEY: "x:y"` may be a property of a classification
+                        # object, so it does not make the line a definition.
+                        deflines.add((path, i))
+        if hit or len(lines) <= 5000:
+            texts[path] = lines
+    for name in clash:
+        # Ambiguous: still marks a line as part of a list, but never counts as "the list has it",
+        # so the permissions it might mean stay in the missing set.
+        idents[name] = None
+    return defs, idents, texts, deflines
+
+
+def find_lists(defs: dict, idents: dict, texts: dict, deflines: set = frozenset(), gap: int = 2,
+               min_items: int = 3) -> list[dict]:
+    """Blocks of nearby lines that name >= min_items defined permissions (or their resource names)."""
+    resources = {d.split(":", 1)[0] for d in defs}
+    out = []
+    for path, lines in texts.items():
+        if TEST_PATH.search(path):
+            continue
+        blocks, cur, last = [], None, -99
+        for i, line in enumerate(lines, 1):
+            perms, res = set(), set()
+            for m in STR_LITERAL.finditer(line):
+                v = m.group(1)
+                if v in defs:
+                    perms.add(v)
+                elif v.rstrip(":") in resources and len(v.rstrip(":")) >= 3:
+                    res.add(v.rstrip(":"))
+            amb = set()   # ambiguous names: part of the list, but not known to be any one permission
+            for tok in IDENT.findall(line):
+                if tok in idents:
+                    if idents[tok] is None:
+                        amb.add(tok)
+                    else:
+                        perms.add(idents[tok])
+            if OPENER.search(line.split("//", 1)[0].split(" #", 1)[0]):
+                last = -99   # two lists side by side are kept apart
+            if not perms and not res and not amb:
+                continue
+            if not (cur and i - last <= gap + 1):
+                cur = {"path": path, "start": i, "end": i, "perms": set(), "res": set(), "amb": set(),
+                       "nondef": False, "span": {}}
+                blocks.append(cur)
+            cur["end"] = i
+            cur["perms"] |= perms
+            cur["res"] |= res
+            cur["amb"] |= amb
+            for kind, got in (("permission", perms | amb), ("resource", res)):
+                if got:   # each kind's own line range, so two lists side by side are shown where they are
+                    cur["span"].setdefault(kind, [i, i])[1] = i
+            cur["nondef"] |= (path, i) not in deflines
+            last = i
+        for b in blocks:
+            if not b["nondef"]:
+                continue   # only `NAME = "x:y"` lines: where the permissions are defined, not a list that sorts them
+            for kind, have, n, universe in (("permission", b["perms"], len(b["perms"]) + len(b["amb"]), set(defs)),
+                                            ("resource", b["res"], len(b["res"]), resources)):
+                missing = sorted(universe - have)
+                if n < min_items or not missing:
+                    continue
+                start, end = b["span"][kind]
+                out.append({"path": path, "start": start, "end": end, "kind": kind,
+                            "items": sorted(have), "missing": missing})
+    return out
+
+
+def crosscheck_selftest() -> list[str]:
+    """Regression checks for list boundaries, on synthetic lines (no target code)."""
+    defs = {f"{r}:read": "x" for r in ("aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg")}
+    one = ['    "aaa:read",', '    "bbb:read",', '    "ccc:read",']
+    two = ['    "ddd:read",', '    "eee:read",', '    "fff:read",']
+    cases = {
+        "multi-line lists side by side": ["PRIVILEGED = ["] + one + ["]", "DEFAULT = ["] + two + ["]"],
+        "one-line lists side by side": ['PRIVILEGED = ["aaa:read", "bbb:read", "ccc:read"]',
+                                        'DEFAULT = ["ddd:read", "eee:read", "fff:read"]'],
+        "one-line Go lists side by side": ['privileged := []string{"aaa:read", "bbb:read", "ccc:read"}',
+                                           'def := []string{"ddd:read", "eee:read", "fff:read"}'],
+        "one-line sets side by side": ['PRIVILEGED = frozenset({"aaa:read", "bbb:read", "ccc:read"})',
+                                       'DEFAULT = frozenset({"ddd:read", "eee:read", "fff:read"})'],
+    }
+    errs = []
+    for name, lines in cases.items():
+        got = sorted(tuple(b["items"]) for b in find_lists(defs, {}, {"src/x.py": lines}) if b["kind"] == "permission")
+        want = [("aaa:read", "bbb:read", "ccc:read"), ("ddd:read", "eee:read", "fff:read")]
+        if got != want:
+            errs.append(f"crosscheck selftest ({name}): lists {got}, expected {want}")
+    calls = ['x = f("aaa:read")', 'y = f("bbb:read")', 'z = f("ccc:read")']
+    if len(find_lists(defs, {}, {"src/x.py": calls})) != 1:
+        errs.append("crosscheck selftest (calls on nearby lines): expected one block")
+    return errs
+
+
+XC_MISSING_PER_TASK = 80
+
+
+def crosscheck_tasks(run: Run, cfg: dict) -> list[dict]:
+    defs, idents, texts, deflines = perm_definitions(run, cfg)
+    if len(defs) < 3:
+        run.queue["crosscheck"] = {"definitions": len(defs), "lists": 0, "not_checked": 0}
+        return []
+    blocks = find_lists(defs, idents, texts, deflines)
+    index = merged_index(run)
+
+    def prio(b):
+        rec = index.get(b["path"], {})
+        hinted = bool(PRIV_HINT.search(b["path"])) or "auth" in (rec.get("tags") or [])
+        return (not hinted, -len(b["items"]), b["path"], b["start"])
+
+    blocks.sort(key=prio)
+    budget = int(cfg.get("crosscheck_budget", 30))
+    over = blocks[budget:]
+    run.queue["crosscheck"] = {"definitions": len(defs), "lists": len(blocks), "not_checked": len(over),
+                               "not_checked_paths": sorted({b["path"] for b in over})}
+    prev_run = run.meta.get("prev_run")
+    tasks = []
+    for b in blocks[:budget]:
+        lines = texts[b["path"]]
+        # the same window the prompt shows (list +-15 lines), so a change next to the list is judged again
+        # (indentation kept: in Python it decides which branch a line belongs to)
+        block_text = "\n".join(l.rstrip() for l in lines[max(0, b["start"] - 16):b["end"] + 15])
+        usages = list_usages(texts, b, lines)
+        # A long list of missing items is split so every item is judged (one task per part).
+        parts = [b["missing"][i:i + XC_MISSING_PER_TASK] for i in range(0, len(b["missing"]), XC_MISSING_PER_TASK)]
+        for n, part in enumerate(parts, 1):
+            # The key covers the list, the offered items and where the list is used: any change is judged again.
+            key = hashlib.sha256(json.dumps([run.meta["va_version"], b["path"], b["kind"], block_text, part,
+                                             usages]).encode()).hexdigest()[:16]
+            t = {"id": f"c-{key}", **b, "missing": part, "missing_total": len(b["missing"]),
+                 "part": f"{n}/{len(parts)}" if len(parts) > 1 else "", "usages": usages,
+                 "defined_at": {m: defs.get(m, "") for m in part} if b["kind"] == "permission" else {}}
+            # Same list, same items, same usages as last run: reuse the verdict instead of paying again.
+            old = run.target_dir / "runs" / prev_run / "results" / f"{t['id']}.json" if prev_run else None
+            if old and old.exists() and not (run.path / "results" / f"{t['id']}.json").exists():
+                res = rjson(old, {})
+                res["_meta"] = {**(res.get("_meta") or {}), "reused_from": prev_run}
+                wjson(run.path / "results" / f"{t['id']}.json", res)
+            tasks.append(t)
+    return tasks
+
+
+def list_usages(texts: dict, b: dict, lines: list[str]) -> list[str]:
+    """Where the list's name is used (so the model can see whether an absent item is allowed or denied)."""
+    name = None
+    # the line that opens the list is usually just above the first item, else the first item's own line
+    for ln in (b["start"] - 1, b["start"] - 2, b["start"] - 3, b["start"]):
+        m = LIST_NAME.search(lines[ln - 1]) if 0 < ln <= len(lines) else None
+        if m and m.group(1) not in {"case", "return", "if", "for", "var", "const", "let", "true", "false"} \
+                and not STR_LITERAL.search(lines[ln - 1][:m.start()]):
+            name = m.group(1)
+            break
+    if not name or len(name) < 3:
+        return []
+    word = re.compile(rf"\b{re.escape(name)}\b")
+    out = []
+    for path, ls in texts.items():
+        for i, line in enumerate(ls, 1):
+            if path == b["path"] and b["start"] - 3 <= i <= b["end"]:
+                continue
+            if word.search(line):
+                # the line before and the two after too: the condition and what it does are often on separate lines
+                out.append("\n".join(f"{path}:{j}: {ls[j - 1].rstrip()[:160]}"
+                                      for j in range(max(1, i - 1), min(len(ls), i + 2) + 1)))
+                if len(out) >= 8:
+                    return out
+    return out
+
+
+def crosscheck_merged(run: Run, tasks: list[dict]) -> list[dict]:
+    """One candidate per list: the parts of a long list are judged separately and combined here."""
+    groups: dict = {}
+    for t in tasks:
+        groups.setdefault((t["path"], t["start"], t["end"], t["kind"]), []).append(t)
+    out = []
+    for ts in groups.values():
+        rs = [r for r in (run.result(t["id"]) for t in ts) if r and r.get("decides_access") and r.get("missing")]
+        if not rs:
+            continue
+        order = {"yes": 0, "unknown": 1, "no": 2}
+        res = {**rs[0], "missing": sorted({m for r in rs for m in r["missing"]}),
+               "fail_open": min((r["fail_open"] for r in rs), key=order.get),
+               "severity": min((r["severity"] for r in rs), key=SEV_ORDER.get),
+               "evidence": " ".join(dict.fromkeys(r["evidence"] for r in rs if r.get("evidence")))}
+        out += crosscheck_candidates(ts[0], res)
+    return out
+
+
+def crosscheck_candidates(task: dict, res: dict | None) -> list[dict]:
+    if not res or not res.get("decides_access") or not res.get("missing"):
+        return []
+    sev = res["severity"]
+    # Only an omission that falls to the permissive side is an escalation; cap the rest.
+    cap = {"yes": "critical", "unknown": "medium", "no": "low"}[res["fail_open"]]
+    if SEV_ORDER[sev] < SEV_ORDER[cap]:
+        sev = cap
+    miss = ", ".join(res["missing"][:20]) + (" …" if len(res["missing"]) > 20 else "")
+    return [{
+        "category": "authz-list-gap", "path": task["path"], "line": task["start"], "source": "crosscheck",
+        "title": f"{task['kind'].capitalize()} list misses {len(res['missing'])} defined item(s)"[:80],
+        "severity": sev, "confidence": res["confidence"], "attacker": res["attacker"],
+        "evidence": (f"List at lines {task['start']}-{task['end']} ({res['list_purpose']}) lacks: {miss}. "
+                     f"Fail-open: {res['fail_open']}. {res['evidence']}")[:700],
+        "fix": res["fix"] or "Derive the list from the definitions (or mark each definition) and add a test that every defined item is classified.",
+        "usages": task.get("usages") or [],
+        # The fingerprint covers the missing items, so a verdict on other items is not reused for these.
+        "fp_extra": ",".join(res["missing"]),
+    }]
 
 
 def line_at(p: Path, n: int) -> str:
@@ -619,10 +907,13 @@ def merged_index(run: Run) -> dict[str, dict]:
 
 # ----------------------------------------------------------------------------- prompts & validation
 
+TEMPLATES = {"summarize": "summarize-file.md", "review": "review-file.md", "crosscheck": "check-list-gap.md",
+             "triage": "triage-candidate.md"}
+
+
 def build_prompt(run: Run, stage: str, task: dict) -> str:
     cfg = load_config(run.root, run.meta["repo"])
-    tpl = (AGENTS / "prompts" / "tasks" / {"summarize": "summarize-file.md", "review": "review-file.md",
-                                           "triage": "triage-candidate.md"}[stage]).read_text(encoding="utf-8")
+    tpl = (AGENTS / "prompts" / "tasks" / TEMPLATES[stage]).read_text(encoding="utf-8")
     model = task.get("model") or run.meta["model"]
     notes = model_notes(model, stage, run.root)
     if stage == "summarize":
@@ -649,6 +940,21 @@ def build_prompt(run: Run, stage: str, task: dict) -> str:
                     CHECKLIST="\n\n".join(f"### {c['id']}\n{c['body']}" for c in chosen),
                     CATEGORIES=", ".join(cats), CHUNK_NOTE=note, CONTENT=numbered(chunk, task["start"]),
                     MODEL_NOTES=notes)
+    if stage == "crosscheck":
+        lines = (run.src / task["path"]).read_text(encoding="utf-8", errors="replace").splitlines()
+        s, e = max(1, task["start"] - 15), min(len(lines), task["end"] + 15)
+        if e - s > 300:   # a very long list: show its head and tail
+            shown = numbered(lines[s - 1:s + 149], s) + "\n  ... |\n" + numbered(lines[e - 150:e], e - 149)
+        else:
+            shown = numbered(lines[s - 1:e], s)
+        missing = "\n".join(f"- {m}" + (f"  (appears at {task['defined_at'][m]})" if task.get("defined_at", {}).get(m) else "")
+                            for m in task["missing"])
+        if task.get("part"):
+            missing += f"\n(part {task['part']} of {task['missing_total']} items; the other parts are checked separately)"
+        rec = merged_index(run).get(task["path"], {})
+        return fill(tpl, PATH=task["path"], KIND=task["kind"], START=task["start"], END=task["end"],
+                    SUMMARY=rec.get("purpose", "(none)"), ITEMS=", ".join(task["items"][:80]), MISSING=missing,
+                    USAGES="\n".join(task.get("usages") or []) or "(not found)", CONTENT=shown, MODEL_NOTES=notes)
     # triage
     cands = {c["fingerprint"]: c for c in rjson(run.path / "candidates.json", [])}
     c = cands[task["fingerprint"]]
@@ -657,8 +963,11 @@ def build_prompt(run: Run, stage: str, task: dict) -> str:
     s, e = max(1, ln - 60), min(len(lines), ln + 40)
     rec = merged_index(run).get(c["path"], {})
     shown = {k: c.get(k) for k in ("category", "title", "line", "severity", "confidence", "attacker", "evidence", "source")}
+    content = numbered(lines[s - 1:e], s)
+    if c.get("usages"):   # crosscheck: where the list is used, often in another file
+        content += "\n```\n\n## Where the list's name is used (other lines and files)\n```\n" + "\n".join(c["usages"])
     return fill(tpl, CANDIDATE=json.dumps(shown, ensure_ascii=False, indent=1), PATH=c["path"],
-                SUMMARY=rec.get("purpose", "(none)"), CONTENT=numbered(lines[s - 1:e], s), MODEL_NOTES=notes)
+                SUMMARY=rec.get("purpose", "(none)"), CONTENT=content, MODEL_NOTES=notes)
 
 
 def validate(stage: str, obj: dict, task: dict, run: Run) -> dict:
@@ -700,6 +1009,26 @@ def validate(stage: str, obj: dict, task: dict, run: Run) -> dict:
                 "evidence": str(c.get("evidence", ""))[:500], "fix": str(c.get("fix", ""))[:300],
             })
         return {"candidates": out, "dropped": dropped}
+    if stage == "crosscheck":
+        if not isinstance(obj.get("decides_access"), bool):
+            raise ValueError("'decides_access' must be a JSON boolean")
+        if obj.get("fail_open") not in {"yes", "no", "unknown"}:
+            raise ValueError("'fail_open' must be yes, no or unknown")
+        given = set(task["missing"])
+        missing = obj.get("missing") or []
+        if not isinstance(missing, list):
+            raise ValueError("'missing' must be a list")
+        return {
+            "list_purpose": str(obj.get("list_purpose", ""))[:200],
+            "decides_access": obj["decides_access"],
+            "fail_open": obj["fail_open"],
+            "missing": sorted({str(m) for m in missing} & given),   # only items the script offered
+            "invented": sorted({str(m) for m in missing} - given)[:20],
+            "severity": obj.get("severity") if obj.get("severity") in SEVERITIES else "medium",
+            "confidence": obj.get("confidence") if obj.get("confidence") in CONFIDENCE else "low",
+            "attacker": obj.get("attacker") if obj.get("attacker") in ATTACKERS else "unknown",
+            "evidence": str(obj.get("evidence", ""))[:400], "fix": str(obj.get("fix", ""))[:300],
+        }
     if obj.get("status") not in STATUSES:
         raise ValueError(f"'status' must be one of {sorted(STATUSES)}")
     return {
@@ -808,9 +1137,6 @@ def cmd_submit(a) -> None:
 
 # ----------------------------------------------------------------------------- report
 
-SEV_ORDER = {s: i for i, s in enumerate(SEVERITIES)}
-
-
 def cmd_report(a) -> None:
     run = Run(Path(a.run).resolve())
     advance(run)
@@ -822,6 +1148,9 @@ def cmd_report(a) -> None:
     prev = {f["fingerprint"]: f for f in rjson(tdir / "runs" / prev_run / "findings.json", [])} if prev_run else {}
 
     reviewed = {t["path"] for t in run.queue["tasks"].get("review", []) if run.result(t["id"])}
+    xc_tasks = run.queue["tasks"].get("crosscheck", [])
+    xc_bad = set(run.queue.get("crosscheck", {}).get("not_checked_paths", [])) | {t["path"] for t in xc_tasks if not run.result(t["id"])}
+    xc_done = set(run.queue["files"]) - xc_bad if "crosscheck" in run.queue else set()
     findings = []
     for c in rjson(run.path / "candidates.json", []):
         if c.get("suppressed"):
@@ -846,6 +1175,13 @@ def cmd_report(a) -> None:
         if fp in cur or f["status"] == "false_positive" or fp in state.get("suppressed", {}):
             continue
         path = f["location"]["path"]
+        if f.get("source") == "crosscheck":
+            # Resolved only when every list in that file was checked this run (none over budget, none failed).
+            if path in deleted or path in xc_done:
+                resolved.append(f)
+            else:
+                findings.append({**f, "carried_over": True})
+            continue
         if path in deleted or path in reviewed or f.get("source") in {"semgrep", "gitleaks", "osv-scanner"}:
             resolved.append(f)
         else:
@@ -930,6 +1266,32 @@ def render_malice(run: Run, live: list, hdr: str, row) -> list[str]:
     return out + [""]
 
 
+PRIV_CATEGORIES = {"privilege-escalation", "authz-list-gap"}
+REPRODUCE = ("in an environment you own, give a test principal only the permission that manages roles; call an API that "
+             "needs the missing permission (expect 403); create a role holding it and assign it to the same principal; "
+             "call again (200 confirms). Record both status codes and the commit, and keep details private until fixed.")
+
+
+def render_privilege(run: Run, live: list, hdr: str, row) -> list[str]:
+    """Privilege escalation: role/grant checks (review) and permission lists that miss defined permissions (crosscheck)."""
+    xc = run.queue.get("crosscheck", {})
+    tasks = run.queue["tasks"].get("crosscheck", [])
+    done = [t for t in tasks if run.result(t["id"])]
+    fs = [f for f in live if f["category"] in PRIV_CATEGORIES]
+    out = ["## Privilege-escalation check", "",
+           "Whether a principal can grant itself (or others) more than it holds: role creation and assignment checks, "
+           "and lists that classify permissions (privileged, internal, reserved, ...) cross-checked against every "
+           "permission-like literal defined in the code.", "",
+           f"- Permission-like literals found: {xc.get('definitions', 0)}",
+           f"- Candidate lists found: {xc.get('lists', 0)} / cross-check tasks done: {len(done)} of {len(tasks)}"
+           + (f" ({xc['not_checked']} over budget)" if xc.get("not_checked") else ""), ""]
+    if fs:
+        out += [hdr] + [row(f) for f in fs] + ["", f"Reproduce each of these by hand, outside VA: {REPRODUCE}"]
+    else:
+        out.append("No privilege-escalation findings.")
+    return out + [""]
+
+
 def render_report(run: Run, findings: list, prev: dict, resolved: list) -> str:
     m = run.meta
     live = [f for f in findings if f["status"] != "false_positive"]
@@ -952,8 +1314,10 @@ def render_report(run: Run, findings: list, prev: dict, resolved: list) -> str:
            f"- LLM tasks {m['usage']['tasks']} run, {m['usage'].get('reused', 0)} reused, {m['usage']['failed']} failed / cost ≈ ${m['usage']['cost_usd']}", "",
            "## Summary", "", f"- New: {counts(new)}", f"- Continuing: {counts(cont)}", f"- Resolved: {len(resolved)}",
            f"- Rejected as false positive: {len(fps)}",
-           f"- Signs of malicious intent: {len([f for f in live if f['category'] in MALICE_CATEGORIES])}", ""]
+           f"- Signs of malicious intent: {len([f for f in live if f['category'] in MALICE_CATEGORIES])}",
+           f"- Privilege escalation: {len([f for f in live if f['category'] in PRIV_CATEGORIES])}", ""]
     out += render_malice(run, live, hdr, row)
+    out += render_privilege(run, live, hdr, row)
     for title, fs in (("New findings", new), ("Continuing findings", cont)):
         out += [f"## {title}", ""]
         out += ([hdr] + [row(f) for f in fs]) if fs else ["None."]
@@ -962,7 +1326,10 @@ def render_report(run: Run, findings: list, prev: dict, resolved: list) -> str:
             if f["severity"] in ("critical", "high", "medium") and not f.get("carried_over"):
                 out += [f"### {f['title']} (`{f['fingerprint']}`)", "",
                         f"- **Where**: `{f['location']['path']}:{f['location']['line']}`  **Attacker**: {f['attacker']}",
-                        f"- **Evidence**: {f['evidence']}", f"- **Triage**: {f['rationale']}", f"- **Fix**: {f['fix']}", ""]
+                        f"- **Evidence**: {f['evidence']}", f"- **Triage**: {f['rationale']}", f"- **Fix**: {f['fix']}"]
+                if f["category"] in PRIV_CATEGORIES:
+                    out.append(f"- **Reproduce (by hand, outside VA)**: {REPRODUCE}")
+                out.append("")
     out += ["## Resolved since last run", ""]
     out += [f"- `{f['fingerprint']}` {f['title']} (`{f['location']['path']}`)" for f in resolved] or ["None."]
     sus = sorted(p for p, r in load_index(run.target_dir).items() if r.get("injection_suspect"))
@@ -978,6 +1345,9 @@ def render_report(run: Run, findings: list, prev: dict, resolved: list) -> str:
     out.append(f"- Skipped files: {json.dumps(inv['skipped'])}")
     nr = run.queue.get("not_reviewed", [])
     out.append(f"- Indexed but not reviewed this run: {len(nr)} files" + (" (diff mode: unchanged files outside the rotation)" if m["mode"] == "diff" else " (review budget reached)" if nr else ""))
+    xc = run.queue.get("crosscheck", {})
+    if xc.get("not_checked"):
+        out.append(f"- Permission lists not cross-checked (crosscheck_budget reached): {xc['not_checked']}")
     for name, st in m.get("tools", {}).items():
         if st != "ok":
             out.append(f"- Tool `{name}`: {st}")
@@ -1044,6 +1414,7 @@ def cmd_validate(a) -> None:
             errs.append(f"{c['file']}: more than 10 items; split it")
     need = {"summarize-file.md": ["TAGS", "PATH", "CONTENT"],
             "review-file.md": ["PATH", "CHECKLIST", "CATEGORIES", "CONTENT", "MODEL_NOTES"],
+            "check-list-gap.md": ["PATH", "ITEMS", "MISSING", "CONTENT", "MODEL_NOTES"],
             "triage-candidate.md": ["CANDIDATE", "CONTENT", "MODEL_NOTES"]}
     for name, keys in need.items():
         txt = (AGENTS / "prompts" / "tasks" / name).read_text(encoding="utf-8")
@@ -1052,6 +1423,7 @@ def cmd_validate(a) -> None:
                 errs.append(f"prompts/tasks/{name}: missing placeholder {{{{{k}}}}}")
     if not re.fullmatch(r"\d+\.\d+\.\d+", va_version()):
         errs.append(".agents/VERSION is not SemVer")
+    errs += crosscheck_selftest()
     for e in errs:
         print("ERROR", e)
     print(f"{len(ids)} checklists, {len(cats_all)} categories, {len(errs)} errors")

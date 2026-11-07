@@ -69,6 +69,7 @@ DB は使わない。git が履歴とレビュー（PR）を提供し、CI か�
 |---|---|
 | 対象コード内のプロンプトインジェクション | 各タスクは独立プロセス・空ディレクトリ・ツールなしで実行。出力はスキーマ検証。AI 向けの文は `injection_suspect` として最優先でレビューしレポートに列挙 |
 | 対象コード自身の悪意（バックドア・持ち出し・悪性依存・インストールフック） | `malicious-code` チェックリストを全レビューに適用、`malice_suspect` を最優先、フック・依存の宣言は強制レビュー、osv の `MAL-` を critical、レポートに専用節（`08-malicious-intent.md`） |
+| 権限の分類の一覧の漏れによる権限昇格（1 ファイルのレビューでは見えない） | `privilege-escalation` チェックリスト、ロール・権限らしいパスは強制レビュー、crosscheck 段階で定義の集合と一覧を突き合わせ、レポートに専用節と再現手順の雛形（`09-privilege-escalation.md`） |
 | 細工された要約で重要ファイルを隠す | 要約は優先度付けにのみ使用。パス名ヒューリスティック・kind で強制レビュー |
 | 対象コードの実行 | 実行しない（静的解析ツールのみ）。CI では対象を `persist-credentials: false` で checkout、retrospective 前に削除 |
 | public への情報漏洩 | `.gitignore`、提案ブランチの push はスクリプトのみ（sanitize 必須）、非公開 denylist、`va-guard` CI |
