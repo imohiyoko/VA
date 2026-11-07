@@ -18,7 +18,8 @@
   - 新しい段階 crosscheck（review と triage の間）: スクリプトが権限らしいリテラル `"<resource>:<action>"`（`perm_pattern` で変更可）の
     定義の集合と、それを並べた一覧の候補を決定的に抜き出し、漏れのある一覧 1 つずつを軽量モデルが判定する
     （`prompts/tasks/check-list-gap.md`）。`decides_access` かつ `missing` ありで `authz-list-gap` の候補になり、通常どおり triage する。
-    同じ一覧・同じ漏れは前回の判定を再利用、1 run の上限は `crosscheck_budget`（既定 30）
+    同じ一覧・同じ漏れ・同じ使われ方は前回の判定を再利用、1 run の上限は `crosscheck_budget`（既定 30）。漏れが 80 件を超える一覧は
+    分けて全件判定し、1 件にまとめる。fingerprint に漏れた項目を含める。一覧の使われ方を triage にも渡す
   - triage に `authz-list-gap` / `privilege-escalation` の判定基準（一覧・確かめが付与の判断に使われ、緩い側に倒れるか）を追加
   - `report.md` に「Privilege-escalation check」節（ゼロ件でも出す）と Summary の件数、該当 finding に手での再現手順の雛形
     （付与の前に 403、付与の後に 200。VA は対象を実行しない）を追加

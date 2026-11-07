@@ -578,11 +578,10 @@ def advance(run: Run) -> None:
         for t in tasks["review"]:
             for c in (run.result(t["id"]) or {}).get("candidates", []):
                 allc.append({**c, "path": t["path"], "source": "llm"})
-        for t in tasks["crosscheck"]:
-            allc += crosscheck_candidates(t, run.result(t["id"]))
+        allc += crosscheck_merged(run, tasks["crosscheck"])
         for c in allc:
             line_text = line_at(run.src / c["path"], c.get("line", 0)) or c.get("title", "")
-            fp = fingerprint(c["category"], c["path"], line_text)
+            fp = fingerprint(c["category"], c["path"], line_text + ("|" + c["fp_extra"] if c.get("fp_extra") else ""))
             if fp in seen:
                 continue
             seen.add(fp)
@@ -618,28 +617,30 @@ def advance(run: Run) -> None:
 # exists, not that it is short, so the script does the cross-file part: it collects the permission-like literals defined
 # anywhere, finds blocks that list several of them, and hands one block plus the defined items it lacks to a small model.
 
+# A line that opens a new collection (`NAME = [`, `var x = map[...]{`, `PRIVILEGED = frozenset({`): a list boundary.
+OPENER = re.compile(r"""[A-Za-z_][\w.]*\s*(?::=|=)\s*[^"'`=]*[\[{(]\s*$""")
 STR_LITERAL = re.compile(r"""["'`]([^"'`\n]{1,80})["'`]""")
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # NAME = "x:y" / NAME Type = "x:y" / NAME := Perm("x:y") / NAME: "x:y", ending at the literal's opening quote
-ASSIGN = re.compile(r"""([A-Za-z_][A-Za-z0-9_]*)(?:\s+[A-Za-z_][\w.]*)?\s*(?::=|=|:)\s*(?:[A-Za-z_][\w.]*\s*\(\s*)?["'`]$""")
+ASSIGN = re.compile(r"""([A-Za-z_][A-Za-z0-9_]*)(?:\s+[A-Za-z_][\w.]*)?\s*(:=|=|:)\s*(?:[A-Za-z_][\w.]*\s*\(\s*)?["'`]$""")
 DECL_WORDS = {"export", "const", "var", "let", "final", "static", "public", "private", "protected", "readonly", "val",
               "def", "pub", "internal", "type"}
 LIST_NAME = re.compile(r"""([A-Za-z_][A-Za-z0-9_]*)\s*(?::=|=|:|\bin\b)""")
 
 
-def assigned_name(seg: str) -> str | None:
-    """Name assigned the literal whose opening quote ends seg, skipping declaration keywords."""
+def assigned_name(seg: str) -> tuple[str, str] | None:
+    """(name, operator) assigned the literal whose opening quote ends seg, skipping declaration keywords."""
     m, pos = ASSIGN.search(seg), 0
     while m and m.group(1) in DECL_WORDS:
         pos = m.start(1) + len(m.group(1))
         m = ASSIGN.search(seg, pos)
-    return m.group(1) if m else None
+    return (m.group(1), m.group(2)) if m else None
 
 
 def perm_definitions(run: Run, cfg: dict) -> tuple[dict, dict, dict, set]:
     """(perm -> first "path:line", identifier -> perm, path -> lines, {(path, line)} that define a constant)."""
     pat = re.compile(cfg.get("perm_pattern") or PERM_LITERAL)
-    defs, idents, texts, deflines = {}, {}, {}, set()
+    defs, idents, texts, deflines, clash = {}, {}, {}, set(), set()
     for path, f in sorted(run.queue["files"].items()):
         if TEST_PATH.search(path) or f["lang"] in {"dotenv"}:
             continue
@@ -655,12 +656,19 @@ def perm_definitions(run: Run, cfg: dict) -> tuple[dict, dict, dict, set]:
                     continue
                 hit = True
                 defs.setdefault(v, f"{path}:{i}")
-                name = assigned_name(line[:m.start() + 1])
-                if name:
-                    idents.setdefault(name, v)
-                    deflines.add((path, i))
+                got = assigned_name(line[:m.start() + 1])
+                if got:
+                    name, op = got
+                    if idents.setdefault(name, v) != v:
+                        clash.add(name)   # same name, different permission in another scope: do not guess
+                    if op != ":":
+                        # `NAME = "x:y"` defines a constant. `KEY: "x:y"` may be a property of a classification
+                        # object, so it does not make the line a definition.
+                        deflines.add((path, i))
         if hit or len(lines) <= 5000:
             texts[path] = lines
+    for name in clash:   # an unresolved name never counts as "the list has it", so the item stays missing
+        idents.pop(name, None)
     return defs, idents, texts, deflines
 
 
@@ -684,6 +692,8 @@ def find_lists(defs: dict, idents: dict, texts: dict, deflines: set = frozenset(
             for tok in IDENT.findall(line):
                 if tok in idents:
                     perms.add(idents[tok])
+            if OPENER.search(line.split("//", 1)[0].split(" #", 1)[0]):
+                last = -99   # two lists side by side are kept apart
             if not perms and not res:
                 continue
             if cur and i - last <= gap + 1:
@@ -713,6 +723,9 @@ def find_lists(defs: dict, idents: dict, texts: dict, deflines: set = frozenset(
     return out
 
 
+XC_MISSING_PER_TASK = 80
+
+
 def crosscheck_tasks(run: Run, cfg: dict) -> list[dict]:
     defs, idents, texts, deflines = perm_definitions(run, cfg)
     if len(defs) < 3:
@@ -728,22 +741,31 @@ def crosscheck_tasks(run: Run, cfg: dict) -> list[dict]:
 
     blocks.sort(key=prio)
     budget = int(cfg.get("crosscheck_budget", 30))
-    run.queue["crosscheck"] = {"definitions": len(defs), "lists": len(blocks), "not_checked": max(0, len(blocks) - budget)}
+    over = blocks[budget:]
+    run.queue["crosscheck"] = {"definitions": len(defs), "lists": len(blocks), "not_checked": len(over),
+                               "not_checked_paths": sorted({b["path"] for b in over})}
     prev_run = run.meta.get("prev_run")
     tasks = []
     for b in blocks[:budget]:
         lines = texts[b["path"]]
         block_text = re.sub(r"\s+", "", "\n".join(lines[b["start"] - 1:b["end"]]))
-        key = hashlib.sha256(json.dumps([run.meta["va_version"], b["path"], b["kind"], block_text, b["missing"]]).encode()).hexdigest()[:16]
-        t = {"id": f"c-{key}", **b, "defined_at": {m: defs.get(m, "") for m in b["missing"][:80]} if b["kind"] == "permission" else {}}
-        t["usages"] = list_usages(texts, b, lines)
-        # Same block and same missing items as last run: reuse the verdict instead of paying again.
-        old = run.target_dir / "runs" / prev_run / "results" / f"{t['id']}.json" if prev_run else None
-        if old and old.exists() and not (run.path / "results" / f"{t['id']}.json").exists():
-            res = rjson(old, {})
-            res["_meta"] = {**(res.get("_meta") or {}), "reused_from": prev_run}
-            wjson(run.path / "results" / f"{t['id']}.json", res)
-        tasks.append(t)
+        usages = list_usages(texts, b, lines)
+        # A long list of missing items is split so every item is judged (one task per part).
+        parts = [b["missing"][i:i + XC_MISSING_PER_TASK] for i in range(0, len(b["missing"]), XC_MISSING_PER_TASK)]
+        for n, part in enumerate(parts, 1):
+            # The key covers the list, the offered items and where the list is used: any change is judged again.
+            key = hashlib.sha256(json.dumps([run.meta["va_version"], b["path"], b["kind"], block_text, part,
+                                             usages]).encode()).hexdigest()[:16]
+            t = {"id": f"c-{key}", **b, "missing": part, "missing_total": len(b["missing"]),
+                 "part": f"{n}/{len(parts)}" if len(parts) > 1 else "", "usages": usages,
+                 "defined_at": {m: defs.get(m, "") for m in part} if b["kind"] == "permission" else {}}
+            # Same list, same items, same usages as last run: reuse the verdict instead of paying again.
+            old = run.target_dir / "runs" / prev_run / "results" / f"{t['id']}.json" if prev_run else None
+            if old and old.exists() and not (run.path / "results" / f"{t['id']}.json").exists():
+                res = rjson(old, {})
+                res["_meta"] = {**(res.get("_meta") or {}), "reused_from": prev_run}
+                wjson(run.path / "results" / f"{t['id']}.json", res)
+            tasks.append(t)
     return tasks
 
 
@@ -772,6 +794,25 @@ def list_usages(texts: dict, b: dict, lines: list[str]) -> list[str]:
     return out
 
 
+def crosscheck_merged(run: Run, tasks: list[dict]) -> list[dict]:
+    """One candidate per list: the parts of a long list are judged separately and combined here."""
+    groups: dict = {}
+    for t in tasks:
+        groups.setdefault((t["path"], t["start"], t["end"], t["kind"]), []).append(t)
+    out = []
+    for ts in groups.values():
+        rs = [r for r in (run.result(t["id"]) for t in ts) if r and r.get("decides_access") and r.get("missing")]
+        if not rs:
+            continue
+        order = {"yes": 0, "unknown": 1, "no": 2}
+        res = {**rs[0], "missing": sorted({m for r in rs for m in r["missing"]}),
+               "fail_open": min((r["fail_open"] for r in rs), key=order.get),
+               "severity": min((r["severity"] for r in rs), key=SEV_ORDER.get),
+               "evidence": " ".join(dict.fromkeys(r["evidence"] for r in rs if r.get("evidence")))}
+        out += crosscheck_candidates(ts[0], res)
+    return out
+
+
 def crosscheck_candidates(task: dict, res: dict | None) -> list[dict]:
     if not res or not res.get("decides_access") or not res.get("missing"):
         return []
@@ -788,6 +829,9 @@ def crosscheck_candidates(task: dict, res: dict | None) -> list[dict]:
         "evidence": (f"List at lines {task['start']}-{task['end']} ({res['list_purpose']}) lacks: {miss}. "
                      f"Fail-open: {res['fail_open']}. {res['evidence']}")[:700],
         "fix": res["fix"] or "Derive the list from the definitions (or mark each definition) and add a test that every defined item is classified.",
+        "usages": task.get("usages") or [],
+        # The fingerprint covers the missing items, so a verdict on other items is not reused for these.
+        "fp_extra": ",".join(res["missing"]),
     }]
 
 
@@ -864,9 +908,10 @@ def build_prompt(run: Run, stage: str, task: dict) -> str:
             shown = numbered(lines[s - 1:s + 149], s) + "\n  ... |\n" + numbered(lines[e - 150:e], e - 149)
         else:
             shown = numbered(lines[s - 1:e], s)
-        miss = task["missing"][:80]
         missing = "\n".join(f"- {m}" + (f"  (appears at {task['defined_at'][m]})" if task.get("defined_at", {}).get(m) else "")
-                            for m in miss) + (f"\n- … and {len(task['missing']) - 80} more" if len(task["missing"]) > 80 else "")
+                            for m in task["missing"])
+        if task.get("part"):
+            missing += f"\n(part {task['part']} of {task['missing_total']} items; the other parts are checked separately)"
         rec = merged_index(run).get(task["path"], {})
         return fill(tpl, PATH=task["path"], KIND=task["kind"], START=task["start"], END=task["end"],
                     SUMMARY=rec.get("purpose", "(none)"), ITEMS=", ".join(task["items"][:80]), MISSING=missing,
@@ -879,8 +924,11 @@ def build_prompt(run: Run, stage: str, task: dict) -> str:
     s, e = max(1, ln - 60), min(len(lines), ln + 40)
     rec = merged_index(run).get(c["path"], {})
     shown = {k: c.get(k) for k in ("category", "title", "line", "severity", "confidence", "attacker", "evidence", "source")}
+    content = numbered(lines[s - 1:e], s)
+    if c.get("usages"):   # crosscheck: where the list is used, often in another file
+        content += "\n```\n\n## Where the list's name is used (other lines and files)\n```\n" + "\n".join(c["usages"])
     return fill(tpl, CANDIDATE=json.dumps(shown, ensure_ascii=False, indent=1), PATH=c["path"],
-                SUMMARY=rec.get("purpose", "(none)"), CONTENT=numbered(lines[s - 1:e], s), MODEL_NOTES=notes)
+                SUMMARY=rec.get("purpose", "(none)"), CONTENT=content, MODEL_NOTES=notes)
 
 
 def validate(stage: str, obj: dict, task: dict, run: Run) -> dict:
@@ -1061,6 +1109,9 @@ def cmd_report(a) -> None:
     prev = {f["fingerprint"]: f for f in rjson(tdir / "runs" / prev_run / "findings.json", [])} if prev_run else {}
 
     reviewed = {t["path"] for t in run.queue["tasks"].get("review", []) if run.result(t["id"])}
+    xc_tasks = run.queue["tasks"].get("crosscheck", [])
+    xc_bad = set(run.queue.get("crosscheck", {}).get("not_checked_paths", [])) | {t["path"] for t in xc_tasks if not run.result(t["id"])}
+    xc_done = set(run.queue["files"]) - xc_bad if "crosscheck" in run.queue else set()
     findings = []
     for c in rjson(run.path / "candidates.json", []):
         if c.get("suppressed"):
@@ -1085,9 +1136,14 @@ def cmd_report(a) -> None:
         if fp in cur or f["status"] == "false_positive" or fp in state.get("suppressed", {}):
             continue
         path = f["location"]["path"]
-        xc_all = not run.queue.get("crosscheck", {}).get("not_checked")   # every list was checked this run
-        if (path in deleted or path in reviewed or f.get("source") in {"semgrep", "gitleaks", "osv-scanner"}
-                or (f.get("source") == "crosscheck" and xc_all)):
+        if f.get("source") == "crosscheck":
+            # Resolved only when every list in that file was checked this run (none over budget, none failed).
+            if path in deleted or path in xc_done:
+                resolved.append(f)
+            else:
+                findings.append({**f, "carried_over": True})
+            continue
+        if path in deleted or path in reviewed or f.get("source") in {"semgrep", "gitleaks", "osv-scanner"}:
             resolved.append(f)
         else:
             findings.append({**f, "carried_over": True})
@@ -1188,10 +1244,10 @@ def render_privilege(run: Run, live: list, hdr: str, row) -> list[str]:
            "and lists that classify permissions (privileged, internal, reserved, ...) cross-checked against every "
            "permission-like literal defined in the code.", "",
            f"- Permission-like literals found: {xc.get('definitions', 0)}",
-           f"- Candidate lists cross-checked: {len(done)} of {xc.get('lists', 0)}"
+           f"- Candidate lists found: {xc.get('lists', 0)} / cross-check tasks done: {len(done)} of {len(tasks)}"
            + (f" ({xc['not_checked']} over budget)" if xc.get("not_checked") else ""), ""]
     if fs:
-        out += [hdr] + [row(f) for f in fs]
+        out += [hdr] + [row(f) for f in fs] + ["", f"Reproduce each of these by hand, outside VA: {REPRODUCE}"]
     else:
         out.append("No privilege-escalation findings.")
     return out + [""]
