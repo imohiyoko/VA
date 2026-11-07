@@ -659,7 +659,9 @@ def perm_definitions(run: Run, cfg: dict) -> tuple[dict, dict, dict, set]:
                 got = assigned_name(line[:m.start() + 1])
                 if got:
                     name, op = got
-                    if idents.setdefault(name, v) != v:
+                    if name in clash:
+                        pass
+                    elif idents.setdefault(name, v) != v:
                         clash.add(name)   # same name, different permission in another scope: do not guess
                     if op != ":":
                         # `NAME = "x:y"` defines a constant. `KEY: "x:y"` may be a property of a classification
@@ -667,8 +669,10 @@ def perm_definitions(run: Run, cfg: dict) -> tuple[dict, dict, dict, set]:
                         deflines.add((path, i))
         if hit or len(lines) <= 5000:
             texts[path] = lines
-    for name in clash:   # an unresolved name never counts as "the list has it", so the item stays missing
-        idents.pop(name, None)
+    for name in clash:
+        # Ambiguous: still marks a line as part of a list, but never counts as "the list has it",
+        # so the permissions it might mean stay in the missing set.
+        idents[name] = None
     return defs, idents, texts, deflines
 
 
@@ -689,23 +693,26 @@ def find_lists(defs: dict, idents: dict, texts: dict, deflines: set = frozenset(
                     perms.add(v)
                 elif v.rstrip(":") in resources and len(v.rstrip(":")) >= 3:
                     res.add(v.rstrip(":"))
+            amb = set()   # ambiguous names: part of the list, but not known to be any one permission
             for tok in IDENT.findall(line):
                 if tok in idents:
-                    perms.add(idents[tok])
+                    if idents[tok] is None:
+                        amb.add(tok)
+                    else:
+                        perms.add(idents[tok])
             if OPENER.search(line.split("//", 1)[0].split(" #", 1)[0]):
                 last = -99   # two lists side by side are kept apart
-            if not perms and not res:
+            if not perms and not res and not amb:
                 continue
-            if cur and i - last <= gap + 1:
-                cur["end"] = i
-                cur["perms"] |= perms
-                cur["res"] |= res
-            else:
-                cur = {"path": path, "start": i, "end": i, "perms": set(), "res": set(), "nondef": False, "span": {}}
+            if not (cur and i - last <= gap + 1):
+                cur = {"path": path, "start": i, "end": i, "perms": set(), "res": set(), "amb": set(),
+                       "nondef": False, "span": {}}
                 blocks.append(cur)
-                cur["perms"] |= perms
-                cur["res"] |= res
-            for kind, got in (("permission", perms), ("resource", res)):
+            cur["end"] = i
+            cur["perms"] |= perms
+            cur["res"] |= res
+            cur["amb"] |= amb
+            for kind, got in (("permission", perms | amb), ("resource", res)):
                 if got:   # each kind's own line range, so two lists side by side are shown where they are
                     cur["span"].setdefault(kind, [i, i])[1] = i
             cur["nondef"] |= (path, i) not in deflines
@@ -713,9 +720,10 @@ def find_lists(defs: dict, idents: dict, texts: dict, deflines: set = frozenset(
         for b in blocks:
             if not b["nondef"]:
                 continue   # only `NAME = "x:y"` lines: where the permissions are defined, not a list that sorts them
-            for kind, have, universe in (("permission", b["perms"], set(defs)), ("resource", b["res"], resources)):
+            for kind, have, n, universe in (("permission", b["perms"], len(b["perms"]) + len(b["amb"]), set(defs)),
+                                            ("resource", b["res"], len(b["res"]), resources)):
                 missing = sorted(universe - have)
-                if len(have) < min_items or not missing:
+                if n < min_items or not missing:
                     continue
                 start, end = b["span"][kind]
                 out.append({"path": path, "start": start, "end": end, "kind": kind,
